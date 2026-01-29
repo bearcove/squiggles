@@ -159,69 +159,9 @@ impl Backend {
             .log_message(MessageType::INFO, message.into())
             .await;
     }
-}
 
-#[tower_lsp::async_trait]
-impl LanguageServer for Backend {
-    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Store workspace root
-        if let Some(root_uri) = params.root_uri {
-            if let Ok(path) = root_uri.to_file_path() {
-                let mut state = self.state.write().await;
-                state.workspace_root = Some(path);
-            }
-        }
-
-        Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                // We provide diagnostics (test failures as squiggles)
-                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
-                    DiagnosticOptions {
-                        identifier: Some("squiggles".to_string()),
-                        inter_file_dependencies: false,
-                        workspace_diagnostics: true,
-                        work_done_progress_options: WorkDoneProgressOptions::default(),
-                    },
-                )),
-                // We'll watch for file saves to trigger test runs
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::NONE), // We don't need content changes
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(false),
-                        })),
-                        ..Default::default()
-                    },
-                )),
-                // Hover to show full panic output
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                // Inlay hints showing test pass/fail status
-                inlay_hint_provider: Some(OneOf::Left(true)),
-                ..Default::default()
-            },
-            server_info: Some(ServerInfo {
-                name: "squiggles".to_string(),
-                version: option_env!("CARGO_PKG_VERSION").map(|s| s.to_string()),
-            }),
-        })
-    }
-
-    async fn initialized(&self, _: InitializedParams) {
-        let state = self.state.read().await;
-        let enabled = state.config.enabled;
-        drop(state);
-
-        if !enabled {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    "squiggles: disabled (create .config/squiggles/config.styx with {enabled true})",
-                )
-                .await;
-            return;
-        }
-
+    /// Start watching for file changes and running tests.
+    async fn start_watching(&self) {
         self.client
             .log_message(MessageType::INFO, "squiggles LSP initialized")
             .await;
@@ -281,6 +221,237 @@ impl LanguageServer for Backend {
 
         // Trigger initial test run
         let _ = self.test_trigger.send(()).await;
+    }
+
+    /// Watch for config file to be created, then start up.
+    async fn watch_for_config(&self, workspace_root: PathBuf) {
+        use notify::{Event, EventKind, RecursiveMode, Watcher};
+
+        let config_dir = workspace_root.join(".config/squiggles");
+        let config_file = config_dir.join("config.styx");
+
+        // Create channel for config file events
+        let (tx, mut rx) = mpsc::channel::<notify::Result<Event>>(16);
+
+        let watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.blocking_send(res);
+        });
+
+        let mut watcher = match watcher {
+            Ok(w) => w,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("Cannot watch for config file: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        // Watch the .config directory (or workspace root if it doesn't exist)
+        let watch_path = if config_dir.exists() {
+            &config_dir
+        } else {
+            &workspace_root
+        };
+
+        if let Err(e) = watcher.watch(watch_path, RecursiveMode::Recursive) {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Cannot watch for config file: {e}"),
+                )
+                .await;
+            return;
+        }
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Waiting for config file: {}", config_file.display()),
+            )
+            .await;
+
+        let client = self.client.clone();
+        let state = self.state.clone();
+        let test_trigger = self.test_trigger.clone();
+
+        // Spawn task to watch for config file
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let Ok(event) = event else { continue };
+
+                // Check if the event is for our config file
+                let is_config_related = event.paths.iter().any(|p| {
+                    p.ends_with("config.styx")
+                        || p.ends_with(".config/squiggles")
+                        || p.ends_with(".config")
+                });
+
+                if !is_config_related {
+                    continue;
+                }
+
+                // Check if it's a create or modify event
+                let is_create_or_modify =
+                    matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+
+                if !is_create_or_modify || !config_file.exists() {
+                    continue;
+                }
+
+                // Try to read and parse the config
+                let content = match tokio::fs::read_to_string(&config_file).await {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Parse with facet-styx
+                let config: std::result::Result<crate::config::Config, _> =
+                    facet_styx::from_str(&content);
+                let Ok(config) = config else { continue };
+
+                if !config.enabled {
+                    continue;
+                }
+
+                // Config is now enabled! Update state and start watching
+                client
+                    .log_message(MessageType::INFO, "Config file detected, starting up...")
+                    .await;
+
+                {
+                    let mut state_guard = state.write().await;
+                    state_guard.config = config;
+                }
+
+                // Start the file watcher for tests
+                let state_guard = state.read().await;
+                if let Some(ref root) = state_guard.workspace_root {
+                    let debounce_ms = state_guard.config.debounce_ms;
+                    let root = root.clone();
+                    drop(state_guard);
+
+                    if let Ok(mut file_watcher) = FileWatcher::new(&root, debounce_ms) {
+                        let test_trigger = test_trigger.clone();
+                        let watcher_client = client.clone();
+
+                        tokio::spawn(async move {
+                            while let Some(event) = file_watcher.rx.recv().await {
+                                match event {
+                                    WatcherEvent::FileSaved(path) => {
+                                        watcher_client
+                                            .log_message(
+                                                MessageType::INFO,
+                                                format!(
+                                                    "File changed (debounced): {}",
+                                                    path.display()
+                                                ),
+                                            )
+                                            .await;
+                                        let _ = test_trigger.send(()).await;
+                                    }
+                                    WatcherEvent::Error(e) => {
+                                        watcher_client
+                                            .log_message(
+                                                MessageType::ERROR,
+                                                format!("Watcher error: {e}"),
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
+                        });
+
+                        client
+                            .log_message(MessageType::INFO, format!("Watching: {}", root.display()))
+                            .await;
+                    }
+                }
+
+                // Trigger initial test run
+                let _ = test_trigger.send(()).await;
+
+                // Stop watching for config - we're now active
+                break;
+            }
+
+            // Keep watcher alive until we break
+            drop(watcher);
+        });
+    }
+}
+
+#[tower_lsp::async_trait]
+impl LanguageServer for Backend {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Store workspace root
+        if let Some(root_uri) = params.root_uri {
+            if let Ok(path) = root_uri.to_file_path() {
+                let mut state = self.state.write().await;
+                state.workspace_root = Some(path);
+            }
+        }
+
+        Ok(InitializeResult {
+            capabilities: ServerCapabilities {
+                // We provide diagnostics (test failures as squiggles)
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("squiggles".to_string()),
+                        inter_file_dependencies: false,
+                        workspace_diagnostics: true,
+                        work_done_progress_options: WorkDoneProgressOptions::default(),
+                    },
+                )),
+                // We'll watch for file saves to trigger test runs
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::NONE), // We don't need content changes
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(false),
+                        })),
+                        ..Default::default()
+                    },
+                )),
+                // Hover to show full panic output
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Inlay hints showing test pass/fail status
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                ..Default::default()
+            },
+            server_info: Some(ServerInfo {
+                name: "squiggles".to_string(),
+                version: option_env!("CARGO_PKG_VERSION").map(|s| s.to_string()),
+            }),
+        })
+    }
+
+    async fn initialized(&self, _: InitializedParams) {
+        let state = self.state.read().await;
+        let enabled = state.config.enabled;
+        let workspace_root = state.workspace_root.clone();
+        drop(state);
+
+        if !enabled {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    "squiggles: disabled (create .config/squiggles/config.styx with {enabled true})",
+                )
+                .await;
+
+            // Watch for config file to appear
+            if let Some(root) = workspace_root {
+                self.watch_for_config(root).await;
+            }
+            return;
+        }
+
+        self.start_watching().await;
     }
 
     async fn shutdown(&self) -> Result<()> {
