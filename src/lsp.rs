@@ -738,26 +738,7 @@ async fn test_runner_loop(
     client: Client,
 ) {
     use crate::diagnostics::failures_to_diagnostics;
-    use crate::runner::{RunOutcome, RunStats, run_tests};
-
-    /// Log run statistics to the client
-    async fn log_stats(client: &Client, stats: &RunStats) {
-        client
-            .log_message(
-                MessageType::LOG,
-                format!(
-                    "[squiggles] cmd={} cwd={} elapsed={}ms exit={:?} stdout={} stderr={} json={}",
-                    stats.command,
-                    stats.cwd,
-                    stats.elapsed_ms,
-                    stats.exit_code,
-                    stats.stdout_lines,
-                    stats.stderr_lines,
-                    stats.json_messages,
-                ),
-            )
-            .await;
-    }
+    use crate::runner::{RunLogEvent, RunOutcome, run_tests_verbose};
 
     while rx.recv().await.is_some() {
         // Coalesce multiple rapid triggers into one run
@@ -786,17 +767,63 @@ async fn test_runner_loop(
             ProgressHandle::begin(client.clone(), "Squiggles", Some("Running tests...".into()))
                 .await;
 
-        client
-            .log_message(
-                MessageType::INFO,
-                format!("Running tests in {}...", workspace_root.display()),
-            )
-            .await;
+        // Set up verbose logging channel
+        let (log_tx, mut log_rx) = mpsc::channel::<RunLogEvent>(4096);
+        let log_client = client.clone();
+
+        // Spawn a task to forward log events to the LSP client
+        let log_task = tokio::spawn(async move {
+            while let Some(event) = log_rx.recv().await {
+                match event {
+                    RunLogEvent::Starting { command, cwd } => {
+                        log_client
+                            .log_message(
+                                MessageType::INFO,
+                                format!("[squiggles] STARTING: {command}\n  cwd: {cwd}"),
+                            )
+                            .await;
+                    }
+                    RunLogEvent::Stdout { line, parsed } => {
+                        let status = match &parsed {
+                            Ok(desc) => format!("OK: {desc}"),
+                            Err(e) => format!("PARSE_ERROR: {e}\n  line: {line}"),
+                        };
+                        log_client
+                            .log_message(MessageType::LOG, format!("[squiggles] stdout: {status}"))
+                            .await;
+                    }
+                    RunLogEvent::Stderr { line } => {
+                        log_client
+                            .log_message(MessageType::LOG, format!("[squiggles] stderr: {line}"))
+                            .await;
+                    }
+                    RunLogEvent::Completed { stats } => {
+                        log_client
+                            .log_message(
+                                MessageType::INFO,
+                                format!(
+                                    "[squiggles] COMPLETED: elapsed={}ms exit={:?} stdout={} stderr={} json={}",
+                                    stats.elapsed_ms,
+                                    stats.exit_code,
+                                    stats.stdout_lines,
+                                    stats.stderr_lines,
+                                    stats.json_messages,
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
 
         // Run tests - this always completes, never hangs
-        match run_tests(&workspace_root, &config).await {
-            RunOutcome::Tests(result, stats) => {
-                log_stats(&client, &stats).await;
+        let outcome = run_tests_verbose(&workspace_root, &config, Some(log_tx)).await;
+
+        // Wait for log task to finish
+        let _ = log_task.await;
+
+        match outcome {
+            RunOutcome::Tests(result, _stats) => {
                 let summary = if result.failed == 0 {
                     format!("✓ {}/{} passed", result.passed, result.total)
                 } else {
@@ -872,9 +899,7 @@ async fn test_runner_loop(
                 // End progress with summary
                 progress.end(Some(summary)).await;
             }
-            RunOutcome::BuildFailed(stderr, stats) => {
-                log_stats(&client, &stats).await;
-
+            RunOutcome::BuildFailed(stderr, _stats) => {
                 // Build failed - show the error to the user
                 let first_line = stderr.lines().next().unwrap_or("Build failed");
                 let summary = format!("⚠ Build failed: {first_line}");

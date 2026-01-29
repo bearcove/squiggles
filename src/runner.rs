@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -69,6 +70,22 @@ pub enum RunOutcome {
     ProcessFailed(String),
 }
 
+/// A log event emitted during a test run.
+#[derive(Debug, Clone)]
+pub enum RunLogEvent {
+    /// Starting the command.
+    Starting { command: String, cwd: String },
+    /// A line from stdout was processed.
+    Stdout {
+        line: String,
+        parsed: Result<String, String>,
+    },
+    /// A line from stderr was received.
+    Stderr { line: String },
+    /// The run completed.
+    Completed { stats: RunStats },
+}
+
 /// Run tests and collect failures.
 ///
 /// Spawns `cargo nextest run` with JSON output and parses the streaming results.
@@ -77,6 +94,17 @@ pub enum RunOutcome {
 /// This function reads both stdout and stderr concurrently, so it won't hang
 /// even if the build fails and produces no JSON output.
 pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
+    run_tests_verbose(workspace_root, config, None).await
+}
+
+/// Run tests with verbose logging via a channel.
+///
+/// If `log_tx` is provided, log events will be sent as they happen.
+pub async fn run_tests_verbose(
+    workspace_root: &Path,
+    config: &Config,
+    log_tx: Option<mpsc::Sender<RunLogEvent>>,
+) -> RunOutcome {
     let start_time = Instant::now();
 
     let mut args = vec![
@@ -99,6 +127,18 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
     }
 
     let command_str = format!("cargo {}", args.join(" "));
+    let cwd_str = workspace_root.display().to_string();
+
+    // Log start
+    if let Some(ref tx) = log_tx {
+        let _ = tx
+            .send(RunLogEvent::Starting {
+                command: command_str.clone(),
+                cwd: cwd_str.clone(),
+            })
+            .await;
+    }
+
     info!(
         cwd = %workspace_root.display(),
         command = %command_str,
@@ -141,6 +181,10 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
         }
     };
 
+    // Clone log_tx for the spawned tasks
+    let stdout_log_tx = log_tx.clone();
+    let stderr_log_tx = log_tx.clone();
+
     // Read stdout and stderr concurrently
     let stdout_handle = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
@@ -159,46 +203,67 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
                 Ok(msg) => {
                     got_any_json = true;
                     json_lines += 1;
-                    match msg {
+
+                    let description = match &msg {
                         NextestMessage::Suite(suite_event) => match suite_event {
                             crate::nextest::SuiteEvent::Started { test_count, .. } => {
-                                total = test_count;
-                                debug!(test_count, "Suite started");
+                                total = *test_count;
+                                format!("suite:started test_count={test_count}")
                             }
                             crate::nextest::SuiteEvent::Failed {
                                 passed: p,
                                 failed: f,
                                 ..
+                            } => {
+                                passed = *p;
+                                failed = *f;
+                                format!("suite:failed passed={p} failed={f}")
                             }
-                            | crate::nextest::SuiteEvent::Ok {
+                            crate::nextest::SuiteEvent::Ok {
                                 passed: p,
                                 failed: f,
                                 ..
                             } => {
-                                passed = p;
-                                failed = f;
-                                debug!(passed = p, failed = f, "Suite finished");
+                                passed = *p;
+                                failed = *f;
+                                format!("suite:ok passed={p} failed={f}")
                             }
                         },
-                        NextestMessage::Test(test_event) => match &test_event {
+                        NextestMessage::Test(test_event) => match test_event {
                             nextest::TestEvent::Ok { name, .. } => {
-                                debug!(test = %name, "Test passed");
                                 passed_tests.push(name.clone());
+                                format!("test:ok {name}")
                             }
                             nextest::TestEvent::Failed { name, .. } => {
-                                debug!(test = %name, "Test failed");
                                 if let Some(failure) = test_event.parse_failure() {
                                     failures.push(failure);
                                 }
+                                format!("test:failed {name}")
                             }
                             nextest::TestEvent::Started { name, .. } => {
-                                debug!(test = %name, "Test started");
+                                format!("test:started {name}")
                             }
                         },
+                    };
+
+                    if let Some(ref tx) = stdout_log_tx {
+                        let _ = tx
+                            .send(RunLogEvent::Stdout {
+                                line: line.clone(),
+                                parsed: Ok(description),
+                            })
+                            .await;
                     }
                 }
-                Err(_) => {
-                    // Non-JSON line, could be cargo output
+                Err(e) => {
+                    if let Some(ref tx) = stdout_log_tx {
+                        let _ = tx
+                            .send(RunLogEvent::Stdout {
+                                line: line.clone(),
+                                parsed: Err(format!("{e}")),
+                            })
+                            .await;
+                    }
                     debug!(line = %line, "Non-JSON stdout line");
                 }
             }
@@ -225,6 +290,11 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
 
         while let Ok(Some(line)) = reader.next_line().await {
             stderr_lines += 1;
+
+            if let Some(ref tx) = stderr_log_tx {
+                let _ = tx.send(RunLogEvent::Stderr { line: line.clone() }).await;
+            }
+
             debug!(line = %line, "stderr");
             if !stderr_output.is_empty() {
                 stderr_output.push('\n');
@@ -273,13 +343,22 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
 
     let stats = RunStats {
         command: command_str.clone(),
-        cwd: workspace_root.display().to_string(),
+        cwd: cwd_str,
         elapsed_ms: elapsed.as_millis() as u64,
         exit_code,
         stdout_lines,
         stderr_lines,
         json_messages: json_lines,
     };
+
+    // Log completion
+    if let Some(ref tx) = log_tx {
+        let _ = tx
+            .send(RunLogEvent::Completed {
+                stats: stats.clone(),
+            })
+            .await;
+    }
 
     info!(
         elapsed_ms = stats.elapsed_ms,
