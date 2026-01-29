@@ -416,11 +416,11 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Store workspace root
-        if let Some(root_uri) = params.root_uri {
-            if let Ok(path) = root_uri.to_file_path() {
-                let mut state = self.state.write().await;
-                state.workspace_root = Some(path);
-            }
+        if let Some(root_uri) = params.root_uri
+            && let Ok(path) = root_uri.to_file_path()
+        {
+            let mut state = self.state.write().await;
+            state.workspace_root = Some(path);
         }
 
         Ok(InitializeResult {
@@ -786,7 +786,7 @@ impl LanguageServer for Backend {
 ///
 /// Note: This uses rustc_lexer for proper tokenization but cannot expand macros,
 /// so macro-generated tests won't be detected.
-
+///
 /// A span in source code (0-indexed line and column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -1078,13 +1078,12 @@ async fn test_runner_loop(
                                         .split("test_count=")
                                         .nth(1)
                                         .and_then(|s| s.split_whitespace().next())
+                                        && let Ok(count) = count_str.parse::<u32>()
                                     {
-                                        if let Ok(count) = count_str.parse::<u32>() {
-                                            tests_total += count;
-                                            log_progress
-                                                .report(format!("Running tests (0/{tests_total})"))
-                                                .await;
-                                        }
+                                        tests_total += count;
+                                        log_progress
+                                            .report(format!("Running tests (0/{tests_total})"))
+                                            .await;
                                     }
                                 } else if desc.starts_with("test:ok")
                                     || desc.starts_with("test:failed")
@@ -1340,13 +1339,11 @@ fn format_failure_hover(failure: &TestFailure, workspace_root: Option<&std::path
 
     // Helper to make path relative to workspace
     let relative_path = |file: &str| -> String {
-        if let Some(root) = workspace_root {
-            if Path::new(file).is_absolute() {
-                // Try to make it relative to workspace
-                if let Ok(rel) = Path::new(file).strip_prefix(root) {
-                    return rel.display().to_string();
-                }
-            }
+        if let Some(root) = workspace_root
+            && Path::new(file).is_absolute()
+            && let Ok(rel) = Path::new(file).strip_prefix(root)
+        {
+            return rel.display().to_string();
         }
         file.strip_prefix("./").unwrap_or(file).to_string()
     };

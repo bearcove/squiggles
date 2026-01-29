@@ -126,13 +126,11 @@ fn parse_build_progress(line: &str) -> Option<BuildProgress> {
     }
 
     // "    Starting 48 tests across 4 binaries"
-    if let Some(rest) = trimmed.strip_prefix("Starting ") {
-        // Parse "48 tests..."
-        if let Some(count_str) = rest.split_whitespace().next() {
-            if let Ok(count) = count_str.parse::<u32>() {
-                return Some(BuildProgress::StartingTests { count });
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("Starting ")
+        && let Some(count_str) = rest.split_whitespace().next()
+        && let Ok(count) = count_str.parse::<u32>()
+    {
+        return Some(BuildProgress::StartingTests { count });
     }
 
     None
@@ -174,13 +172,13 @@ pub async fn run_tests_verbose(
     }
 
     // Add filter expressions if configured
-    if let Some(ref include) = config.include {
-        if !include.is_empty() {
-            let filter = build_filter_expression(include, &config.exclude);
-            if !filter.is_empty() {
-                args.push("-E".to_string());
-                args.push(filter);
-            }
+    if let Some(ref include) = config.include
+        && !include.is_empty()
+    {
+        let filter = build_filter_expression(include, &config.exclude);
+        if !filter.is_empty() {
+            args.push("-E".to_string());
+            args.push(filter);
         }
     }
 
@@ -207,6 +205,7 @@ pub async fn run_tests_verbose(
     cmd.args(&args)
         .current_dir(workspace_root)
         .env("NEXTEST_EXPERIMENTAL_LIBTEST_JSON", "1")
+        .env("RUST_BACKTRACE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

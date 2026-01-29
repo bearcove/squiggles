@@ -314,11 +314,11 @@ fn parse_backtrace_frames(stdout: &str) -> Vec<BacktraceFrame> {
             .unwrap_or(false)
         {
             // Parse index and function
-            if let Some((idx_str, func)) = trimmed.split_once(':') {
-                if let Ok(idx) = idx_str.trim().parse::<u32>() {
-                    current_index = Some(idx);
-                    current_function = Some(func.trim().to_string());
-                }
+            if let Some((idx_str, func)) = trimmed.split_once(':')
+                && let Ok(idx) = idx_str.trim().parse::<u32>()
+            {
+                current_index = Some(idx);
+                current_function = Some(func.trim().to_string());
             }
         }
         // Check for location line: "at ./src/lib.rs:10:5" or "at /abs/path:35"
@@ -331,19 +331,19 @@ fn parse_backtrace_frames(stdout: &str) -> Vec<BacktraceFrame> {
                     && !location_str.contains(".rustup")
                     && !location_str.contains("/rustc/"));
 
-            if is_user_code {
-                if let (Some(idx), Some(func)) = (current_index.take(), current_function.take()) {
-                    // Try parsing with column first, then without
-                    let location = parse_location(location_str)
-                        .or_else(|| parse_location_no_column(location_str));
+            if is_user_code
+                && let (Some(idx), Some(func)) = (current_index.take(), current_function.take())
+            {
+                // Try parsing with column first, then without
+                let location =
+                    parse_location(location_str).or_else(|| parse_location_no_column(location_str));
 
-                    if let Some(location) = location {
-                        frames.push(BacktraceFrame {
-                            index: idx,
-                            function: func,
-                            location,
-                        });
-                    }
+                if let Some(location) = location {
+                    frames.push(BacktraceFrame {
+                        index: idx,
+                        function: func,
+                        location,
+                    });
                 }
             }
         }

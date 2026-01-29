@@ -36,21 +36,20 @@ impl TestFunctionIndex {
         // Walk the workspace looking for .rs files
         if let Ok(entries) = walkdir(workspace_root) {
             for entry in entries {
-                if entry.extension().is_some_and(|e| e == "rs") {
-                    if let Ok(content) = std::fs::read_to_string(&entry) {
-                        if let Ok(uri) = Url::from_file_path(&entry) {
-                            let tests = find_test_functions_detailed(&content);
-                            for info in tests {
-                                by_name.insert(
-                                    info.name.clone(),
-                                    TestLocation {
-                                        uri: uri.clone(),
-                                        attr_span: info.attr_span,
-                                        name_span: info.name_span,
-                                    },
-                                );
-                            }
-                        }
+                if entry.extension().is_some_and(|e| e == "rs")
+                    && let Ok(content) = std::fs::read_to_string(&entry)
+                    && let Ok(uri) = Url::from_file_path(&entry)
+                {
+                    let tests = find_test_functions_detailed(&content);
+                    for info in tests {
+                        by_name.insert(
+                            info.name.clone(),
+                            TestLocation {
+                                uri: uri.clone(),
+                                attr_span: info.attr_span,
+                                name_span: info.name_span,
+                            },
+                        );
                     }
                 }
             }
@@ -75,10 +74,10 @@ fn walkdir(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
 fn walkdir_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
     if dir.is_dir() {
         // Skip target directory and hidden directories
-        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-            if name == "target" || name.starts_with('.') {
-                return Ok(());
-            }
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str())
+            && (name == "target" || name.starts_with('.'))
+        {
+            return Ok(());
         }
 
         for entry in std::fs::read_dir(dir)? {
@@ -310,11 +309,11 @@ pub fn extract_test_name(full_name: &str) -> String {
 /// "left/right" comparisons, etc.
 fn extract_failure_summary(output: &str) -> String {
     // Look for "assertion `left == right` failed" pattern
-    if let Some(idx) = output.find("assertion `") {
-        if let Some(end) = output[idx..].find("` failed") {
-            let assertion = &output[idx..idx + end + "` failed".len()];
-            return assertion.to_string();
-        }
+    if let Some(idx) = output.find("assertion `")
+        && let Some(end) = output[idx..].find("` failed")
+    {
+        let assertion = &output[idx..idx + end + "` failed".len()];
+        return assertion.to_string();
     }
 
     // Look for "assertion failed:" pattern
