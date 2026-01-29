@@ -33,8 +33,15 @@ impl TestFunctionIndex {
     pub fn build(workspace_root: &Path) -> Self {
         let mut by_name = HashMap::new();
 
+        // Canonicalize workspace root to ensure all paths are absolute
+        // (Url::from_file_path requires absolute paths)
+        let workspace_root = match workspace_root.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return Self { by_name },
+        };
+
         // Walk the workspace looking for .rs files
-        if let Ok(entries) = walkdir(workspace_root) {
+        if let Ok(entries) = walkdir(&workspace_root) {
             for entry in entries {
                 if entry.extension().is_some_and(|e| e == "rs")
                     && let Ok(content) = std::fs::read_to_string(&entry)

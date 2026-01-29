@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::*;
 
-use squiggles::diagnostics::extract_test_name;
+use squiggles::diagnostics::{TestFunctionIndex, extract_test_name};
 use squiggles::lsp::{StoredFailure, find_test_functions_detailed};
 use squiggles::nextest::{NextestMessage, parse_message};
 
@@ -261,4 +261,33 @@ mod tests {
         by_name.contains_key(&short_name),
         "index should find test by short name"
     );
+}
+
+/// Test that TestFunctionIndex::build finds tests in the fixture directory.
+///
+/// This is a regression test for a bug where relative paths caused
+/// Url::from_file_path to fail silently, resulting in no tests being indexed.
+#[test]
+fn test_function_index_builds_from_fixture() {
+    use std::path::Path;
+
+    // Build index from fixture directory (using relative path to test the fix)
+    let fixture_path = Path::new("test-fixtures/styx-failure");
+    assert!(fixture_path.exists(), "fixture directory should exist");
+
+    let index = TestFunctionIndex::build(fixture_path);
+
+    // Should find the test function by short name
+    let test_name = "test_ariadne_config_respects_no_color_env";
+    let location = index.get(test_name);
+
+    assert!(
+        location.is_some(),
+        "TestFunctionIndex should find '{}' when built from fixture directory",
+        test_name
+    );
+
+    let loc = location.unwrap();
+    // The function is on line 227 (1-indexed) = line 226 (0-indexed)
+    assert_eq!(loc.name_span.line, 226);
 }
