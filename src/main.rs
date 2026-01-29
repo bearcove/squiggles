@@ -11,16 +11,12 @@ mod watcher;
 
 use config::Config;
 
-/// Squiggles - Continuous Cargo Test LSP
-///
 /// Surfaces test failures as editor diagnostics.
 #[derive(Facet, Debug)]
 struct Args {
-    /// Standard CLI options (--help, --version)
     #[facet(flatten)]
     builtins: args::FigueBuiltins,
 
-    /// Configuration (from .config/squiggles/config.styx)
     #[facet(args::config, args::env_prefix = "SQUIGGLES")]
     config: Config,
 }
@@ -37,7 +33,6 @@ fn main() {
         })
         .help(|h| {
             h.program_name("squiggles")
-                .description("Continuous Cargo Test LSP - surfaces test failures as diagnostics")
                 .version(option_env!("CARGO_PKG_VERSION").unwrap_or("dev"))
         })
         .build();

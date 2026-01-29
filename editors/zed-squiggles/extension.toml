@@ -1,0 +1,11 @@
+id = "squiggles"
+name = "Squiggles"
+description = "Continuous test runner LSP - surfaces Rust test failures as editor diagnostics"
+version = "0.1.0"
+schema_version = 1
+authors = ["Amos Wenger <amos@bearcove.eu>"]
+repository = "https://github.com/bearcove/squiggles"
+
+[language_servers.squiggles]
+name = "Squiggles"
+languages = ["Rust"]
