@@ -800,7 +800,7 @@ async fn test_runner_loop(
     state: Arc<RwLock<ServerState>>,
     client: Client,
 ) {
-    use crate::diagnostics::failures_to_diagnostics;
+    use crate::diagnostics::{TestFunctionIndex, extract_test_name, failures_to_diagnostics};
     use crate::runner::{RunLogEvent, RunOutcome, run_tests_verbose};
 
     while rx.recv().await.is_some() {
@@ -898,9 +898,10 @@ async fn test_runner_loop(
 
                 client.log_message(MessageType::INFO, &summary).await;
 
-                // Convert failures to diagnostics
+                // Build test function index and convert failures to diagnostics
+                let test_index = TestFunctionIndex::build(&workspace_root);
                 let diagnostics_by_file =
-                    failures_to_diagnostics(&result.failures, &workspace_root);
+                    failures_to_diagnostics(&result.failures, &workspace_root, &test_index);
 
                 // Store failures for hover lookup and get stale files
                 let stale_uris = {
@@ -909,16 +910,39 @@ async fn test_runner_loop(
                         .failures
                         .iter()
                         .filter_map(|f| {
-                            let loc = f.panic_location.as_ref()?;
-                            let file_path = resolve_path(&loc.file, &workspace_root);
-                            let uri = Url::from_file_path(&file_path).ok()?;
-                            Some((
-                                uri,
-                                StoredFailure {
-                                    failure: f.clone(),
-                                    range: location_to_range(loc),
-                                },
-                            ))
+                            let short_name = extract_test_name(&f.name);
+                            // Try test function location first, fall back to panic location
+                            if let Some((uri, line)) = test_index.get(&short_name) {
+                                let range = Range {
+                                    start: Position {
+                                        line: *line,
+                                        character: 0,
+                                    },
+                                    end: Position {
+                                        line: *line,
+                                        character: 0,
+                                    },
+                                };
+                                Some((
+                                    uri.clone(),
+                                    StoredFailure {
+                                        failure: f.clone(),
+                                        range,
+                                    },
+                                ))
+                            } else if let Some(loc) = f.panic_location.as_ref() {
+                                let file_path = resolve_path(&loc.file, &workspace_root);
+                                let uri = Url::from_file_path(&file_path).ok()?;
+                                Some((
+                                    uri,
+                                    StoredFailure {
+                                        failure: f.clone(),
+                                        range: location_to_range(loc),
+                                    },
+                                ))
+                            } else {
+                                None
+                            }
                         })
                         .collect();
 
@@ -930,9 +954,29 @@ async fn test_runner_loop(
                             .insert(name.clone(), TestResult::Passed);
                     }
                     for failure in &result.failures {
-                        if let Some(loc) = &failure.panic_location {
+                        let short_name = extract_test_name(&failure.name);
+                        if let Some((uri, line)) = test_index.get(&short_name) {
+                            let range = Range {
+                                start: Position {
+                                    line: *line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: *line,
+                                    character: 0,
+                                },
+                            };
+                            state_guard.test_results.insert(
+                                failure.name.clone(),
+                                TestResult::Failed(StoredFailure {
+                                    failure: failure.clone(),
+                                    range,
+                                }),
+                            );
+                            let _ = uri; // Keep for future use
+                        } else if let Some(loc) = &failure.panic_location {
                             let file_path = resolve_path(&loc.file, &workspace_root);
-                            if let Ok(uri) = Url::from_file_path(&file_path) {
+                            if let Ok(_uri) = Url::from_file_path(&file_path) {
                                 state_guard.test_results.insert(
                                     failure.name.clone(),
                                     TestResult::Failed(StoredFailure {
@@ -940,8 +984,6 @@ async fn test_runner_loop(
                                         range: location_to_range(loc),
                                     }),
                                 );
-                                // Also store without the crate prefix for matching
-                                let _ = uri; // Keep for future use
                             }
                         }
                     }

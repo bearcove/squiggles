@@ -170,7 +170,7 @@ async fn test_runner_with_failures() {
 /// Test diagnostics conversion
 #[tokio::test]
 async fn test_diagnostics_conversion() {
-    use squiggles::diagnostics::failures_to_diagnostics;
+    use squiggles::diagnostics::{TestFunctionIndex, failures_to_diagnostics};
     use squiggles::nextest::{SourceLocation, TestFailure};
 
     let failures = vec![
@@ -199,7 +199,9 @@ async fn test_diagnostics_conversion() {
     ];
 
     let workspace = PathBuf::from("/workspace");
-    let diagnostics = failures_to_diagnostics(&failures, &workspace);
+    // Empty index - will fall back to panic locations
+    let test_index = TestFunctionIndex::build(&workspace);
+    let diagnostics = failures_to_diagnostics(&failures, &workspace, &test_index);
 
     // Should have diagnostics for lib.rs
     let lib_uri = Url::from_file_path("/workspace/src/lib.rs").unwrap();

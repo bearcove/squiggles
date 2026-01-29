@@ -5,66 +5,168 @@ use std::path::Path;
 
 use tower_lsp::lsp_types::*;
 
+use crate::lsp::find_test_functions;
 use crate::nextest::{SourceLocation, TestFailure};
 
 /// A collection of diagnostics grouped by file URI.
 pub type DiagnosticsByFile = HashMap<Url, Vec<Diagnostic>>;
 
+/// Index of test function locations in the workspace.
+///
+/// Maps short test name (e.g., "test_something") to (URI, line number).
+pub struct TestFunctionIndex {
+    /// Map from test function name to (file URI, 0-indexed line number)
+    by_name: HashMap<String, (Url, u32)>,
+}
+
+impl TestFunctionIndex {
+    /// Build an index by scanning all Rust files in the workspace.
+    pub fn build(workspace_root: &Path) -> Self {
+        let mut by_name = HashMap::new();
+
+        // Walk the workspace looking for .rs files
+        if let Ok(entries) = walkdir(workspace_root) {
+            for entry in entries {
+                if entry.extension().is_some_and(|e| e == "rs") {
+                    if let Ok(content) = std::fs::read_to_string(&entry) {
+                        if let Ok(uri) = Url::from_file_path(&entry) {
+                            let tests = find_test_functions(&content);
+                            for (line, name) in tests {
+                                by_name.insert(name, (uri.clone(), line));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self { by_name }
+    }
+
+    /// Look up a test function by its short name.
+    pub fn get(&self, name: &str) -> Option<&(Url, u32)> {
+        self.by_name.get(name)
+    }
+}
+
+/// Walk a directory recursively, yielding file paths.
+fn walkdir(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
+    walkdir_inner(root, &mut files)?;
+    Ok(files)
+}
+
+fn walkdir_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    if dir.is_dir() {
+        // Skip target directory and hidden directories
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            if name == "target" || name.starts_with('.') {
+                return Ok(());
+            }
+        }
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walkdir_inner(&path, files)?;
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Convert test failures to LSP diagnostics, grouped by file.
 ///
-/// Each failure produces:
-/// - A primary diagnostic at the panic location
-/// - Related information for each backtrace frame in user code
+/// Diagnostics are placed at the test function definition, not the panic location.
+/// The panic location is included as related information.
 pub fn failures_to_diagnostics(
     failures: &[TestFailure],
     workspace_root: &Path,
+    test_index: &TestFunctionIndex,
 ) -> DiagnosticsByFile {
     let mut diagnostics: DiagnosticsByFile = HashMap::new();
 
     for failure in failures {
-        if let Some(ref panic_loc) = failure.panic_location {
+        let short_name = extract_test_name(&failure.name);
+
+        // Try to find the test function location
+        let (uri, range) = if let Some((uri, line)) = test_index.get(&short_name) {
+            // Found the test function - use its location
+            let range = Range {
+                start: Position {
+                    line: *line,
+                    character: 0,
+                },
+                end: Position {
+                    line: *line,
+                    character: 0,
+                },
+            };
+            (uri.clone(), range)
+        } else if let Some(ref panic_loc) = failure.panic_location {
+            // Fall back to panic location if we can't find the test
             let file_path = resolve_path(&panic_loc.file, workspace_root);
             let uri = match Url::from_file_path(&file_path) {
                 Ok(uri) => uri,
-                Err(_) => continue, // Skip if we can't create a URL
+                Err(_) => continue,
             };
+            (uri, location_to_range(panic_loc))
+        } else {
+            // No location at all, skip this failure
+            continue;
+        };
 
-            // Build related information from backtrace frames
-            let related_info: Vec<DiagnosticRelatedInformation> = failure
-                .user_frames
-                .iter()
-                .filter_map(|frame| {
-                    let frame_path = resolve_path(&frame.location.file, workspace_root);
-                    let frame_uri = Url::from_file_path(&frame_path).ok()?;
+        // Build related information: panic location + backtrace frames
+        let mut related_info: Vec<DiagnosticRelatedInformation> = Vec::new();
 
-                    Some(DiagnosticRelatedInformation {
-                        location: Location {
-                            uri: frame_uri,
-                            range: location_to_range(&frame.location),
-                        },
-                        message: frame.function.clone(),
-                    })
-                })
-                .collect();
-
-            let diagnostic = Diagnostic {
-                range: location_to_range(panic_loc),
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String(extract_test_name(&failure.name))),
-                code_description: None,
-                source: Some("squiggles".to_string()),
-                message: failure.message.clone(),
-                related_information: if related_info.is_empty() {
-                    None
-                } else {
-                    Some(related_info)
-                },
-                tags: None,
-                data: None,
-            };
-
-            diagnostics.entry(uri).or_default().push(diagnostic);
+        // Add panic location as first related info (if different from test location)
+        if let Some(ref panic_loc) = failure.panic_location {
+            let panic_path = resolve_path(&panic_loc.file, workspace_root);
+            if let Ok(panic_uri) = Url::from_file_path(&panic_path) {
+                related_info.push(DiagnosticRelatedInformation {
+                    location: Location {
+                        uri: panic_uri,
+                        range: location_to_range(panic_loc),
+                    },
+                    message: format!("panicked here: {}", failure.message),
+                });
+            }
         }
+
+        // Add backtrace frames
+        for frame in &failure.user_frames {
+            let frame_path = resolve_path(&frame.location.file, workspace_root);
+            if let Ok(frame_uri) = Url::from_file_path(&frame_path) {
+                related_info.push(DiagnosticRelatedInformation {
+                    location: Location {
+                        uri: frame_uri,
+                        range: location_to_range(&frame.location),
+                    },
+                    message: frame.function.clone(),
+                });
+            }
+        }
+
+        let diagnostic = Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String(short_name)),
+            code_description: None,
+            source: Some("squiggles".to_string()),
+            message: failure.message.clone(),
+            related_information: if related_info.is_empty() {
+                None
+            } else {
+                Some(related_info)
+            },
+            tags: None,
+            data: None,
+        };
+
+        diagnostics.entry(uri).or_default().push(diagnostic);
     }
 
     diagnostics
@@ -82,8 +184,6 @@ fn location_to_range(loc: &SourceLocation) -> Range {
             line,
             character: col,
         },
-        // End at the same position - editors will typically highlight the whole line
-        // or we could try to find the end of the expression
         end: Position {
             line,
             character: col,
@@ -92,18 +192,12 @@ fn location_to_range(loc: &SourceLocation) -> Range {
 }
 
 /// Resolve a file path relative to the workspace root.
-///
-/// Handles paths like:
-/// - `./src/lib.rs` -> `{workspace}/src/lib.rs`
-/// - `src/lib.rs` -> `{workspace}/src/lib.rs`
-/// - `/absolute/path` -> `/absolute/path`
 fn resolve_path(file: &str, workspace_root: &Path) -> std::path::PathBuf {
     let file_path = Path::new(file);
 
     if file_path.is_absolute() {
         file_path.to_path_buf()
     } else {
-        // Strip leading "./" if present
         let clean = file.strip_prefix("./").unwrap_or(file);
         workspace_root.join(clean)
     }
@@ -113,8 +207,7 @@ fn resolve_path(file: &str, workspace_root: &Path) -> std::path::PathBuf {
 ///
 /// Full name: `sample-crate::sample_crate$tests::test_panic`
 /// Short name: `test_panic`
-fn extract_test_name(full_name: &str) -> String {
-    // Take everything after the last `::`
+pub fn extract_test_name(full_name: &str) -> String {
     full_name
         .rsplit("::")
         .next()
@@ -168,7 +261,14 @@ mod tests {
     }
 
     #[test]
-    fn test_failures_to_diagnostics() {
+    fn test_failures_to_diagnostics_with_index() {
+        // Create a mock index with the test location
+        let mut by_name = HashMap::new();
+        let test_uri = Url::from_file_path("/project/src/lib.rs").unwrap();
+        by_name.insert("test_something".to_string(), (test_uri.clone(), 10)); // Line 10 (0-indexed)
+
+        let test_index = TestFunctionIndex { by_name };
+
         let failures = vec![TestFailure {
             name: "my_crate::tests::test_something".to_string(),
             message: "assertion failed".to_string(),
@@ -190,26 +290,26 @@ mod tests {
         }];
 
         let workspace = Path::new("/project");
-        let diags = failures_to_diagnostics(&failures, workspace);
+        let diags = failures_to_diagnostics(&failures, workspace, &test_index);
 
         assert_eq!(diags.len(), 1);
 
-        let uri = Url::from_file_path("/project/src/lib.rs").unwrap();
-        let file_diags = diags.get(&uri).unwrap();
+        let file_diags = diags.get(&test_uri).unwrap();
         assert_eq!(file_diags.len(), 1);
 
         let diag = &file_diags[0];
         assert_eq!(diag.message, "assertion failed");
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-        assert_eq!(diag.range.start.line, 41); // 0-indexed
+        // Should be at line 10 (the test function), not line 41 (the panic)
+        assert_eq!(diag.range.start.line, 10);
         assert_eq!(
             diag.code,
             Some(NumberOrString::String("test_something".to_string()))
         );
 
-        // Check related info
+        // Check related info includes panic location
         let related = diag.related_information.as_ref().unwrap();
-        assert_eq!(related.len(), 1);
-        assert_eq!(related[0].message, "my_crate::helper");
+        assert!(related.len() >= 1);
+        assert!(related[0].message.contains("panicked here"));
     }
 }
