@@ -5,18 +5,25 @@ use std::path::Path;
 
 use tower_lsp::lsp_types::*;
 
-use crate::lsp::find_test_functions;
+use crate::lsp::{Span, find_test_functions_detailed};
 use crate::nextest::{SourceLocation, TestFailure};
 
 /// A collection of diagnostics grouped by file URI.
 pub type DiagnosticsByFile = HashMap<Url, Vec<Diagnostic>>;
 
+/// Stored location of a test function.
+#[derive(Debug, Clone)]
+pub struct TestLocation {
+    pub uri: Url,
+    /// Span of the function name (what we want to highlight)
+    pub name_span: Span,
+}
+
 /// Index of test function locations in the workspace.
 ///
-/// Maps short test name (e.g., "test_something") to (URI, line number).
+/// Maps short test name (e.g., "test_something") to its location.
 pub struct TestFunctionIndex {
-    /// Map from test function name to (file URI, 0-indexed line number)
-    by_name: HashMap<String, (Url, u32)>,
+    by_name: HashMap<String, TestLocation>,
 }
 
 impl TestFunctionIndex {
@@ -30,9 +37,15 @@ impl TestFunctionIndex {
                 if entry.extension().is_some_and(|e| e == "rs") {
                     if let Ok(content) = std::fs::read_to_string(&entry) {
                         if let Ok(uri) = Url::from_file_path(&entry) {
-                            let tests = find_test_functions(&content);
-                            for (line, name) in tests {
-                                by_name.insert(name, (uri.clone(), line));
+                            let tests = find_test_functions_detailed(&content);
+                            for info in tests {
+                                by_name.insert(
+                                    info.name.clone(),
+                                    TestLocation {
+                                        uri: uri.clone(),
+                                        name_span: info.name_span,
+                                    },
+                                );
                             }
                         }
                     }
@@ -44,7 +57,7 @@ impl TestFunctionIndex {
     }
 
     /// Look up a test function by its short name.
-    pub fn get(&self, name: &str) -> Option<&(Url, u32)> {
+    pub fn get(&self, name: &str) -> Option<&TestLocation> {
         self.by_name.get(name)
     }
 }
@@ -93,19 +106,9 @@ pub fn failures_to_diagnostics(
         let short_name = extract_test_name(&failure.name);
 
         // Try to find the test function location
-        let (uri, range) = if let Some((uri, line)) = test_index.get(&short_name) {
-            // Found the test function - use its location
-            let range = Range {
-                start: Position {
-                    line: *line,
-                    character: 0,
-                },
-                end: Position {
-                    line: *line,
-                    character: 0,
-                },
-            };
-            (uri.clone(), range)
+        let (uri, range) = if let Some(loc) = test_index.get(&short_name) {
+            // Found the test function - highlight the function name
+            (loc.uri.clone(), loc.name_span.to_range())
         } else if let Some(ref panic_loc) = failure.panic_location {
             // Fall back to panic location if we can't find the test
             let file_path = resolve_path(&panic_loc.file, workspace_root);
@@ -150,11 +153,12 @@ pub fn failures_to_diagnostics(
             }
         }
 
-        // Build a useful message - if empty, say "test failed"
-        let message = if failure.message.is_empty() {
-            "test failed".to_string()
-        } else {
+        // Build a useful message
+        let message = if !failure.message.is_empty() {
             failure.message.clone()
+        } else {
+            // Try to extract something useful from full_output
+            extract_failure_summary(&failure.full_output)
         };
 
         let diagnostic = Diagnostic {
@@ -222,6 +226,54 @@ pub fn extract_test_name(full_name: &str) -> String {
         .to_string()
 }
 
+/// Extract a useful summary from test failure output when panic message is empty.
+///
+/// Looks for common patterns in test output like assertion failures,
+/// "left/right" comparisons, etc.
+fn extract_failure_summary(output: &str) -> String {
+    // Look for "assertion `left == right` failed" pattern
+    if let Some(idx) = output.find("assertion `") {
+        if let Some(end) = output[idx..].find("` failed") {
+            let assertion = &output[idx..idx + end + "` failed".len()];
+            return assertion.to_string();
+        }
+    }
+
+    // Look for "assertion failed:" pattern
+    if let Some(idx) = output.find("assertion failed:") {
+        let rest = &output[idx + "assertion failed:".len()..];
+        if let Some(line) = rest.lines().next() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                return format!("assertion failed: {trimmed}");
+            }
+        }
+        return "assertion failed".to_string();
+    }
+
+    // Look for "panicked at" without a message (explicit panic)
+    if output.contains("panicked at") {
+        // Check if there's a "Message:" line (color-backtrace format)
+        if let Some(idx) = output.find("Message:") {
+            let rest = &output[idx + "Message:".len()..];
+            if let Some(line) = rest.lines().next() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && trimmed != "explicit panic" {
+                    return trimmed.to_string();
+                }
+            }
+        }
+        return "panic".to_string();
+    }
+
+    // Look for left/right comparison in assertion output
+    if output.contains("left:") && output.contains("right:") {
+        return "assertion failed (values differ)".to_string();
+    }
+
+    "test failed".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,10 +321,22 @@ mod tests {
 
     #[test]
     fn test_failures_to_diagnostics_with_index() {
+        use crate::lsp::Span;
+
         // Create a mock index with the test location
         let mut by_name = HashMap::new();
         let test_uri = Url::from_file_path("/project/src/lib.rs").unwrap();
-        by_name.insert("test_something".to_string(), (test_uri.clone(), 10)); // Line 10 (0-indexed)
+        by_name.insert(
+            "test_something".to_string(),
+            TestLocation {
+                uri: test_uri.clone(),
+                name_span: Span {
+                    line: 10,
+                    col: 4,
+                    len: 14, // "test_something".len()
+                },
+            },
+        );
 
         let test_index = TestFunctionIndex { by_name };
 
@@ -307,8 +371,10 @@ mod tests {
         let diag = &file_diags[0];
         assert_eq!(diag.message, "assertion failed");
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-        // Should be at line 10 (the test function), not line 41 (the panic)
+        // Should be at line 10, column 4, spanning the function name
         assert_eq!(diag.range.start.line, 10);
+        assert_eq!(diag.range.start.character, 4);
+        assert_eq!(diag.range.end.character, 18); // 4 + 14
         // No code - diagnostic is on the test function itself
         assert_eq!(diag.code, None);
 
@@ -316,5 +382,35 @@ mod tests {
         let related = diag.related_information.as_ref().unwrap();
         assert!(related.len() >= 1);
         assert!(related[0].message.contains("panicked here"));
+    }
+
+    #[test]
+    fn test_extract_failure_summary() {
+        // Assertion with backticks
+        assert_eq!(
+            extract_failure_summary("assertion `left == right` failed\nleft: 1\nright: 2"),
+            "assertion `left == right` failed"
+        );
+
+        // Assertion failed with message
+        assert_eq!(
+            extract_failure_summary("assertion failed: x > 0"),
+            "assertion failed: x > 0"
+        );
+
+        // Panic with Message
+        assert_eq!(
+            extract_failure_summary("panicked at foo.rs:10\nMessage: something went wrong"),
+            "something went wrong"
+        );
+
+        // Just left/right
+        assert_eq!(
+            extract_failure_summary("left: 1\nright: 2"),
+            "assertion failed (values differ)"
+        );
+
+        // Nothing useful
+        assert_eq!(extract_failure_summary("some random output"), "test failed");
     }
 }

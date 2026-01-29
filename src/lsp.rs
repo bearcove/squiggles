@@ -644,20 +644,63 @@ impl LanguageServer for Backend {
 ///
 /// Note: This uses rustc_lexer for proper tokenization but cannot expand macros,
 /// so macro-generated tests won't be detected.
-pub fn find_test_functions(content: &str) -> Vec<(u32, String)> {
+
+/// A span in source code (0-indexed line and column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub line: u32,
+    pub col: u32,
+    pub len: u32,
+}
+
+impl Span {
+    /// Convert to an LSP Range.
+    pub fn to_range(self) -> Range {
+        Range {
+            start: Position {
+                line: self.line,
+                character: self.col,
+            },
+            end: Position {
+                line: self.line,
+                character: self.col + self.len,
+            },
+        }
+    }
+}
+
+/// Information about a test function found in source code.
+#[derive(Debug, Clone)]
+pub struct TestFunctionInfo {
+    /// Span of the `#[test]` attribute
+    pub attr_span: Span,
+    /// Span of the function name
+    pub name_span: Span,
+    /// The function name
+    pub name: String,
+}
+
+/// Find all test functions in source code.
+///
+/// Returns detailed info including the range of the function name for diagnostics.
+pub fn find_test_functions_detailed(content: &str) -> Vec<TestFunctionInfo> {
     use rustc_lexer::{TokenKind, tokenize};
 
-    // Build line number lookup: byte offset -> line number (0-indexed)
+    // Build line number lookup: byte offset -> (line number, column)
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(content.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
 
-    let offset_to_line = |offset: usize| -> u32 {
-        match line_starts.binary_search(&offset) {
-            Ok(line) => line as u32,
-            Err(line) => line.saturating_sub(1) as u32,
-        }
+    let offset_to_line_col = |offset: usize| -> (u32, u32) {
+        let line = match line_starts.binary_search(&offset) {
+            Ok(line) => line,
+            Err(line) => line.saturating_sub(1),
+        };
+        let col = offset - line_starts[line];
+        (line as u32, col as u32)
     };
+
+    let _offset_to_line = |offset: usize| -> u32 { offset_to_line_col(offset).0 };
 
     // Tokenize and collect with offsets
     let mut tokens: Vec<(usize, TokenKind, &str)> = Vec::new();
@@ -743,9 +786,23 @@ pub fn find_test_functions(content: &str) -> Vec<(u32, String)> {
                                 i += 1;
                             }
                             if i < tokens.len() && matches!(tokens[i].1, TokenKind::Ident) {
-                                let fn_name = tokens[i].2.to_string();
-                                let line = offset_to_line(attr_offset);
-                                results.push((line, fn_name));
+                                let fn_name_offset = tokens[i].0;
+                                let fn_name = tokens[i].2;
+                                let (name_line, name_col) = offset_to_line_col(fn_name_offset);
+                                let (attr_line, attr_col) = offset_to_line_col(attr_offset);
+                                results.push(TestFunctionInfo {
+                                    attr_span: Span {
+                                        line: attr_line,
+                                        col: attr_col,
+                                        len: 1, // Just the '#' for now
+                                    },
+                                    name_span: Span {
+                                        line: name_line,
+                                        col: name_col,
+                                        len: fn_name.len() as u32,
+                                    },
+                                    name: fn_name.to_string(),
+                                });
                             }
                             break;
                         } else if matches!(ident, "pub" | "async" | "const" | "unsafe" | "extern") {
@@ -765,6 +822,16 @@ pub fn find_test_functions(content: &str) -> Vec<(u32, String)> {
     }
 
     results
+}
+
+/// Find all test functions in source code (simple version for backward compatibility).
+///
+/// Returns (line, name) pairs. Line numbers are 0-indexed.
+pub fn find_test_functions(content: &str) -> Vec<(u32, String)> {
+    find_test_functions_detailed(content)
+        .into_iter()
+        .map(|info| (info.attr_span.line, info.name))
+        .collect()
 }
 
 /// Run the LSP server on stdin/stdout.
@@ -970,22 +1037,12 @@ async fn test_runner_loop(
                         .filter_map(|f| {
                             let short_name = extract_test_name(&f.name);
                             // Try test function location first, fall back to panic location
-                            if let Some((uri, line)) = test_index.get(&short_name) {
-                                let range = Range {
-                                    start: Position {
-                                        line: *line,
-                                        character: 0,
-                                    },
-                                    end: Position {
-                                        line: *line,
-                                        character: 0,
-                                    },
-                                };
+                            if let Some(loc) = test_index.get(&short_name) {
                                 Some((
-                                    uri.clone(),
+                                    loc.uri.clone(),
                                     StoredFailure {
                                         failure: f.clone(),
-                                        range,
+                                        range: loc.name_span.to_range(),
                                     },
                                 ))
                             } else if let Some(loc) = f.panic_location.as_ref() {
@@ -1013,25 +1070,14 @@ async fn test_runner_loop(
                     }
                     for failure in &result.failures {
                         let short_name = extract_test_name(&failure.name);
-                        if let Some((uri, line)) = test_index.get(&short_name) {
-                            let range = Range {
-                                start: Position {
-                                    line: *line,
-                                    character: 0,
-                                },
-                                end: Position {
-                                    line: *line,
-                                    character: 0,
-                                },
-                            };
+                        if let Some(test_loc) = test_index.get(&short_name) {
                             state_guard.test_results.insert(
                                 failure.name.clone(),
                                 TestResult::Failed(StoredFailure {
                                     failure: failure.clone(),
-                                    range,
+                                    range: test_loc.name_span.to_range(),
                                 }),
                             );
-                            let _ = uri; // Keep for future use
                         } else if let Some(loc) = &failure.panic_location {
                             let file_path = resolve_path(&loc.file, &workspace_root);
                             if let Ok(_uri) = Url::from_file_path(&file_path) {
