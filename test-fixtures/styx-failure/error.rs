@@ -1,0 +1,300 @@
+//! Error types for Styx parsing.
+
+use ariadne::{Color, Config, Label, Report, ReportKind, Source};
+use facet_format::{DeserializeError, DeserializeErrorKind};
+
+/// Get ariadne config, respecting NO_COLOR env var.
+fn ariadne_config() -> Config {
+    let no_color = std::env::var("NO_COLOR").is_ok();
+    if no_color {
+        Config::default().with_color(false)
+    } else {
+        Config::default()
+    }
+}
+
+/// Convert a facet_reflect::Span to a Range<usize>.
+fn reflect_span_to_range(span: &facet_reflect::Span) -> std::ops::Range<usize> {
+    let start = span.offset as usize;
+    let end = start + span.len as usize;
+    start..end
+}
+
+/// Trait for rendering errors with ariadne diagnostics.
+pub trait RenderError {
+    /// Render this error with ariadne.
+    ///
+    /// Returns a string containing the formatted error message with source context.
+    fn render(&self, filename: &str, source: &str) -> String;
+
+    /// Write the error report to a writer.
+    fn write_report<W: std::io::Write>(&self, filename: &str, source: &str, writer: W);
+}
+
+/// Rendering support for `DeserializeError`.
+///
+/// This allows rendering the full deserialize error (which may come from the parser
+/// or from facet-format's deserializer) with ariadne diagnostics.
+impl RenderError for DeserializeError {
+    fn render(&self, filename: &str, source: &str) -> String {
+        let mut output = Vec::new();
+        self.write_report(filename, source, &mut output);
+        String::from_utf8(output).unwrap_or_else(|_| format!("{}", self))
+    }
+
+    fn write_report<W: std::io::Write>(&self, filename: &str, source: &str, writer: W) {
+        // IMPORTANT: Config must be applied BEFORE adding labels, because ariadne
+        // applies filter_color when labels are added, not when the report is written.
+        let report = build_deserialize_error_report(self, filename, source, ariadne_config());
+        let _ = report
+            .finish()
+            .write((filename, Source::from(source)), writer);
+    }
+}
+
+fn build_deserialize_error_report<'a>(
+    err: &DeserializeError,
+    filename: &'a str,
+    source: &str,
+    config: Config,
+) -> ariadne::ReportBuilder<'static, (&'a str, std::ops::Range<usize>)> {
+    // Get the range from err.span, with fallback
+    let range = err
+        .span
+        .as_ref()
+        .map(reflect_span_to_range)
+        .unwrap_or(0..source.len().max(1));
+
+    match &err.kind {
+        // Missing field from facet-format
+        DeserializeErrorKind::MissingField {
+            field,
+            container_shape,
+        } => Report::build(ReportKind::Error, (filename, range.clone()))
+            .with_config(config)
+            .with_message(format!("missing required field '{}'", field))
+            .with_label(
+                Label::new((filename, range))
+                    .with_message(format!("in {}", container_shape))
+                    .with_color(Color::Red),
+            )
+            .with_help(format!("{} <value>", field)),
+
+        // Unknown field from facet-format
+        DeserializeErrorKind::UnknownField { field, suggestion } => {
+            let mut report = Report::build(ReportKind::Error, (filename, range.clone()))
+                .with_config(config)
+                .with_message(format!("unknown field '{}'", field))
+                .with_label(
+                    Label::new((filename, range))
+                        .with_message("unknown field")
+                        .with_color(Color::Red),
+                );
+            if let Some(s) = suggestion {
+                report = report.with_help(format!("did you mean '{}'?", s));
+            }
+            report
+        }
+
+        // Type mismatch from facet-format
+        DeserializeErrorKind::TypeMismatch { expected, got } => {
+            Report::build(ReportKind::Error, (filename, range.clone()))
+                .with_config(config)
+                .with_message(format!("type mismatch: expected {}", expected))
+                .with_label(
+                    Label::new((filename, range))
+                        .with_message(format!("got {}", got))
+                        .with_color(Color::Red),
+                )
+        }
+
+        // Reflect errors from facet-format
+        DeserializeErrorKind::Reflect { kind, context } => {
+            let mut report = Report::build(ReportKind::Error, (filename, range.clone()))
+                .with_config(config)
+                .with_message(format!("{}", kind))
+                .with_label(
+                    Label::new((filename, range))
+                        .with_message("error here")
+                        .with_color(Color::Red),
+                );
+            if !context.is_empty() {
+                report = report.with_note(format!("while {}", context));
+            }
+            report
+        }
+
+        // Unexpected EOF
+        DeserializeErrorKind::UnexpectedEof { expected } => {
+            let eof_range = source.len().saturating_sub(1)..source.len().max(1);
+            Report::build(ReportKind::Error, (filename, eof_range.clone()))
+                .with_config(config)
+                .with_message("unexpected end of input")
+                .with_label(
+                    Label::new((filename, eof_range))
+                        .with_message(format!("expected {}", expected))
+                        .with_color(Color::Red),
+                )
+        }
+
+        // Unsupported operation
+        DeserializeErrorKind::Unsupported { message } => {
+            Report::build(ReportKind::Error, (filename, 0..1))
+                .with_config(config)
+                .with_message(format!("unsupported: {}", message))
+        }
+
+        // Cannot borrow
+        DeserializeErrorKind::CannotBorrow { reason } => {
+            Report::build(ReportKind::Error, (filename, 0..1))
+                .with_config(config)
+                .with_message(*reason)
+        }
+
+        // Unexpected token (from parser)
+        DeserializeErrorKind::UnexpectedToken { got, expected } => {
+            Report::build(ReportKind::Error, (filename, range.clone()))
+                .with_config(config)
+                .with_message(format!("unexpected token '{}'", got))
+                .with_label(
+                    Label::new((filename, range))
+                        .with_message(format!("expected {}", expected))
+                        .with_color(Color::Red),
+                )
+        }
+
+        // Invalid value
+        DeserializeErrorKind::InvalidValue { message } => {
+            Report::build(ReportKind::Error, (filename, range.clone()))
+                .with_config(config)
+                .with_message(format!("invalid value: {}", message))
+                .with_label(
+                    Label::new((filename, range))
+                        .with_message("here")
+                        .with_color(Color::Red),
+                )
+        }
+
+        // Catch-all for other error kinds
+        _ => Report::build(ReportKind::Error, (filename, range.clone()))
+            .with_config(config)
+            .with_message(format!("{}", err.kind))
+            .with_label(
+                Label::new((filename, range))
+                    .with_message("error here")
+                    .with_color(Color::Red),
+            ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use facet::Facet;
+
+    #[test]
+    fn test_ariadne_no_color() {
+        // Verify that ariadne respects our config
+        let config = Config::default().with_color(false);
+
+        let source = "test input";
+        let report =
+            Report::<(&str, std::ops::Range<usize>)>::build(ReportKind::Error, ("test.styx", 0..4))
+                .with_config(config)
+                .with_message("test error")
+                .with_label(
+                    Label::new(("test.styx", 0..4))
+                        .with_message("here")
+                        .with_color(Color::Red),
+                )
+                .finish();
+
+        let mut output = Vec::new();
+        report
+            .write(("test.styx", Source::from(source)), &mut output)
+            .unwrap();
+        let s = String::from_utf8(output).unwrap();
+
+        // Check for ANSI escape codes
+        assert!(
+            !s.contains("\x1b["),
+            "Output should not contain ANSI escape codes when color is disabled:\n{:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_ariadne_config_respects_no_color_env() {
+        // Test that ariadne_config() returns correct config based on NO_COLOR
+        let no_color = std::env::var("NO_COLOR").is_ok();
+        eprintln!("NO_COLOR is set: {}", no_color);
+
+        let config = ariadne_config();
+
+        let source = "test input";
+        let report =
+            Report::<(&str, std::ops::Range<usize>)>::build(ReportKind::Error, ("test.styx", 0..4))
+                .with_config(config)
+                .with_message("test error")
+                .with_label(
+                    Label::new(("test.styx", 0..4))
+                        .with_message("here")
+                        .with_color(Color::Red),
+                )
+                .finish();
+
+        let mut output = Vec::new();
+        report
+            .write(("test.styx", Source::from(source)), &mut output)
+            .unwrap();
+        let s = String::from_utf8(output).unwrap();
+        eprintln!("Output: {:?}", s);
+
+        // Always assert - NO_COLOR should be set by nextest setup script
+        assert!(no_color, "NO_COLOR should be set by nextest setup script");
+        assert!(
+            s.contains("\x1b["),
+            "With NO_COLOR set, output should not contain ANSI escape codes:\n{:?}",
+            s
+        );
+    }
+
+    #[derive(Facet, Debug)]
+    struct Person {
+        name: String,
+        age: u32,
+    }
+
+    #[test]
+    fn test_missing_field_diagnostic() {
+        let source = "name Alice";
+        let result: Result<Person, _> = crate::from_str(source);
+        let err = result.unwrap_err();
+
+        crate::assert_snapshot_stripped!(RenderError::render(&err, "test.styx", source));
+    }
+
+    #[test]
+    fn test_invalid_scalar_diagnostic() {
+        let source = "name Alice\nage notanumber";
+        let result: Result<Person, _> = crate::from_str(source);
+        let err = result.unwrap_err();
+
+        crate::assert_snapshot_stripped!(err.render("test.styx", source));
+    }
+
+    #[test]
+    fn test_unknown_field_diagnostic() {
+        #[derive(Facet, Debug)]
+        #[facet(deny_unknown_fields)]
+        struct Strict {
+            name: String,
+        }
+
+        let source = "name Alice\nunknown_field value";
+        let result: Result<Strict, _> = crate::from_str(source);
+        let err = result.unwrap_err();
+
+        crate::assert_snapshot_stripped!(err.render("test.styx", source));
+    }
+}
