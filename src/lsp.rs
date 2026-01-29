@@ -23,6 +23,34 @@ pub struct StoredFailure {
     pub range: Range,
 }
 
+impl StoredFailure {
+    /// Build an LSP Diagnostic from this stored failure.
+    pub fn to_diagnostic(&self) -> Diagnostic {
+        let message = if !self.failure.message.is_empty() {
+            self.failure
+                .message
+                .lines()
+                .next()
+                .unwrap_or("Test failed")
+                .to_string()
+        } else {
+            "Test failed".to_string()
+        };
+
+        Diagnostic {
+            range: self.range,
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: Some("squiggles".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            data: None,
+        }
+    }
+}
+
 /// Result of a single test (pass or fail).
 #[derive(Debug, Clone)]
 pub enum TestResult {
@@ -540,34 +568,8 @@ impl LanguageServer for Backend {
         // Re-publish diagnostics for this file if we have any
         let state = self.state.read().await;
         if let Some(failures) = state.failures.get(&uri.to_string()) {
-            let diagnostics: Vec<Diagnostic> = failures
-                .iter()
-                .map(|stored| {
-                    let message = if !stored.failure.message.is_empty() {
-                        stored
-                            .failure
-                            .message
-                            .lines()
-                            .next()
-                            .unwrap_or("Test failed")
-                            .to_string()
-                    } else {
-                        "Test failed".to_string()
-                    };
-
-                    Diagnostic {
-                        range: stored.range,
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        code: None,
-                        code_description: None,
-                        source: Some("squiggles".to_string()),
-                        message,
-                        related_information: None,
-                        tags: None,
-                        data: None,
-                    }
-                })
-                .collect();
+            let diagnostics: Vec<Diagnostic> =
+                failures.iter().map(StoredFailure::to_diagnostic).collect();
 
             drop(state); // Release lock before async call
             self.client
@@ -609,36 +611,13 @@ impl LanguageServer for Backend {
 
         // Get diagnostics we've already computed for this file
         let state = self.state.read().await;
-
-        // Collect diagnostics for this URI from our stored failures
-        let mut items = Vec::new();
-
-        for stored in state.failures.get(&uri.to_string()).into_iter().flatten() {
-            // Build the message (first line only for the diagnostic)
-            let message = if !stored.failure.message.is_empty() {
-                stored
-                    .failure
-                    .message
-                    .lines()
-                    .next()
-                    .unwrap_or("Test failed")
-                    .to_string()
-            } else {
-                "Test failed".to_string()
-            };
-
-            items.push(Diagnostic {
-                range: stored.range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: None,
-                code_description: None,
-                source: Some("squiggles".to_string()),
-                message,
-                related_information: None,
-                tags: None,
-                data: None,
-            });
-        }
+        let items: Vec<Diagnostic> = state
+            .failures
+            .get(&uri.to_string())
+            .into_iter()
+            .flatten()
+            .map(StoredFailure::to_diagnostic)
+            .collect();
 
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
