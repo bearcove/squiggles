@@ -1178,37 +1178,40 @@ async fn test_runner_loop(
                     failures_to_diagnostics(&result.failures, &workspace_root, &test_index);
 
                 // Store failures for hover lookup and get stale files
+                // We store at BOTH the function name location AND the panic location
+                // so hover works on either.
                 let stale_uris = {
                     let mut state_guard = state.write().await;
-                    let stored: Vec<_> = result
-                        .failures
-                        .iter()
-                        .filter_map(|f| {
-                            let short_name = extract_test_name(&f.name);
-                            // Try test function location first, fall back to panic location
-                            if let Some(loc) = test_index.get(&short_name) {
-                                Some((
-                                    loc.uri.clone(),
-                                    StoredFailure {
-                                        failure: f.clone(),
-                                        range: loc.name_span.to_range(),
-                                    },
-                                ))
-                            } else if let Some(loc) = f.panic_location.as_ref() {
-                                let file_path = resolve_path(&loc.file, &workspace_root);
-                                let uri = Url::from_file_path(&file_path).ok()?;
-                                Some((
+                    let mut stored: Vec<(Url, StoredFailure)> = Vec::new();
+
+                    for f in &result.failures {
+                        let short_name = extract_test_name(&f.name);
+
+                        // Store at the test function location (for hovering on fn name)
+                        if let Some(loc) = test_index.get(&short_name) {
+                            stored.push((
+                                loc.uri.clone(),
+                                StoredFailure {
+                                    failure: f.clone(),
+                                    range: loc.name_span.to_range(),
+                                },
+                            ));
+                        }
+
+                        // Also store at the panic location (for hovering on panic site)
+                        if let Some(panic_loc) = f.panic_location.as_ref() {
+                            let file_path = resolve_path(&panic_loc.file, &workspace_root);
+                            if let Ok(uri) = Url::from_file_path(&file_path) {
+                                stored.push((
                                     uri,
                                     StoredFailure {
                                         failure: f.clone(),
-                                        range: location_to_range(loc),
+                                        range: location_to_range(panic_loc),
                                     },
-                                ))
-                            } else {
-                                None
+                                ));
                             }
-                        })
-                        .collect();
+                        }
+                    }
 
                     // Build new test results map first, then swap atomically
                     // (avoids clearing results while inlay hints might be requested)
