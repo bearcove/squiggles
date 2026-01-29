@@ -3,8 +3,11 @@ use facet_styx::StyxFormat;
 use figue as args;
 
 mod config;
+mod diagnostics;
 mod lsp;
 mod nextest;
+mod runner;
+mod watcher;
 
 use config::Config;
 
