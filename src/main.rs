@@ -6,19 +6,33 @@ mod config;
 mod diagnostics;
 mod lsp;
 mod nextest;
+mod progress;
 mod runner;
 mod watcher;
 
 use config::Config;
 
+/// Subcommands for squiggles.
+#[derive(Facet, Debug)]
+#[repr(u8)]
+enum Command {
+    /// Start the LSP server (for editor integration)
+    Lsp {
+        #[facet(args::config, args::env_prefix = "SQUIGGLES")]
+        config: Config,
+    },
+}
+
+/// Squiggles - Continuous Cargo Test LSP
+///
 /// Surfaces test failures as editor diagnostics.
 #[derive(Facet, Debug)]
 struct Args {
     #[facet(flatten)]
     builtins: args::FigueBuiltins,
 
-    #[facet(args::config, args::env_prefix = "SQUIGGLES")]
-    config: Config,
+    #[facet(args::subcommand)]
+    command: Command,
 }
 
 fn main() {
@@ -39,7 +53,13 @@ fn main() {
 
     let args = args::Driver::new(figue_config).run().unwrap();
 
-    if !args.config.enabled {
+    match args.command {
+        Command::Lsp { config } => run_lsp(config),
+    }
+}
+
+fn run_lsp(config: Config) {
+    if !config.enabled {
         eprintln!("squiggles: not enabled (no config file or enabled = false)");
         eprintln!("hint: create .config/squiggles/config.styx with:");
         eprintln!("  {{enabled true}}");
@@ -51,5 +71,5 @@ fn main() {
         .enable_all()
         .build()
         .expect("failed to create tokio runtime")
-        .block_on(lsp::run(args.config));
+        .block_on(lsp::run(config));
 }

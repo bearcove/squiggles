@@ -11,6 +11,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::config::Config;
 use crate::nextest::TestFailure;
+use crate::progress::ProgressHandle;
 use crate::watcher::{FileWatcher, WatcherEvent};
 
 /// A stored failure for hover lookup.
@@ -20,6 +21,15 @@ pub struct StoredFailure {
     pub failure: TestFailure,
     /// The range in the file where the diagnostic appears.
     pub range: Range,
+}
+
+/// Result of a single test (pass or fail).
+#[derive(Debug, Clone)]
+pub enum TestResult {
+    /// Test passed.
+    Passed,
+    /// Test failed with details.
+    Failed(StoredFailure),
 }
 
 /// Shared state for the LSP server.
@@ -34,6 +44,9 @@ pub struct ServerState {
     /// URIs that currently have published diagnostics.
     /// Used to clear stale diagnostics when tests pass.
     pub files_with_diagnostics: HashSet<String>,
+    /// All test results indexed by full test name (e.g., "crate::module::test_name").
+    /// Used for inlay hints.
+    pub test_results: HashMap<String, TestResult>,
 }
 
 impl ServerState {
@@ -109,6 +122,7 @@ impl Backend {
                 workspace_root: None,
                 failures: HashMap::new(),
                 files_with_diagnostics: HashSet::new(),
+                test_results: HashMap::new(),
             })),
             test_trigger,
         }
@@ -182,6 +196,8 @@ impl LanguageServer for Backend {
                 )),
                 // Hover to show full panic output
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                // Inlay hints showing test pass/fail status
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -361,6 +377,11 @@ async fn test_runner_loop(
             }
         };
 
+        // Start progress indicator
+        let progress =
+            ProgressHandle::begin(client.clone(), "Squiggles", Some("Running tests...".into()))
+                .await;
+
         client
             .log_message(MessageType::INFO, "Running tests...")
             .await;
@@ -368,15 +389,16 @@ async fn test_runner_loop(
         // Run tests
         match run_tests(&workspace_root, &config).await {
             Ok(result) => {
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Tests complete: {} passed, {} failed (of {} total)",
-                            result.passed, result.failed, result.total
-                        ),
+                let summary = if result.failed == 0 {
+                    format!("✓ {}/{} passed", result.passed, result.total)
+                } else {
+                    format!(
+                        "✗ {} failed, {} passed ({} total)",
+                        result.failed, result.passed, result.total
                     )
-                    .await;
+                };
+
+                client.log_message(MessageType::INFO, &summary).await;
 
                 // Convert failures to diagnostics
                 let diagnostics_by_file =
@@ -401,6 +423,31 @@ async fn test_runner_loop(
                             ))
                         })
                         .collect();
+
+                    // Store all test results for inlay hints
+                    state_guard.test_results.clear();
+                    for name in &result.passed_tests {
+                        state_guard
+                            .test_results
+                            .insert(name.clone(), TestResult::Passed);
+                    }
+                    for failure in &result.failures {
+                        if let Some(loc) = &failure.panic_location {
+                            let file_path = resolve_path(&loc.file, &workspace_root);
+                            if let Ok(uri) = Url::from_file_path(&file_path) {
+                                state_guard.test_results.insert(
+                                    failure.name.clone(),
+                                    TestResult::Failed(StoredFailure {
+                                        failure: failure.clone(),
+                                        range: location_to_range(loc),
+                                    }),
+                                );
+                                // Also store without the crate prefix for matching
+                                let _ = uri; // Keep for future use
+                            }
+                        }
+                    }
+
                     state_guard.store_failures(stored)
                 };
 
@@ -414,16 +461,14 @@ async fn test_runner_loop(
                     client.publish_diagnostics(uri, diags, None).await;
                 }
 
-                if result.failures.is_empty() {
-                    client
-                        .log_message(MessageType::INFO, "All tests passing!")
-                        .await;
-                }
+                // End progress with summary
+                progress.end(Some(summary)).await;
             }
             Err(e) => {
                 client
                     .log_message(MessageType::ERROR, format!("Test run failed: {e}"))
                     .await;
+                progress.end(Some(format!("Error: {e}"))).await;
             }
         }
     }

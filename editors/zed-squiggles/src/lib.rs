@@ -19,7 +19,7 @@ impl zed::Extension for SquigglesExtension {
 
         Ok(Command {
             command: path,
-            args: vec![],
+            args: vec!["lsp".to_string()],
             env: vec![],
         })
     }

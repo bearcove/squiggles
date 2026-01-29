@@ -14,6 +14,8 @@ use crate::nextest::{self, NextestMessage, TestFailure};
 pub struct TestRunResult {
     /// All test failures with parsed locations.
     pub failures: Vec<TestFailure>,
+    /// Names of all tests that passed.
+    pub passed_tests: Vec<String>,
     /// Total tests run.
     pub total: u32,
     /// Tests passed.
@@ -59,6 +61,7 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> Result<TestRun
 
     let mut reader = BufReader::new(stdout).lines();
     let mut failures = Vec::new();
+    let mut passed_tests = Vec::new();
     let mut total = 0u32;
     let mut passed = 0u32;
     let mut failed = 0u32;
@@ -87,11 +90,17 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> Result<TestRun
                         }
                     }
                 }
-                NextestMessage::Test(test_event) => {
-                    if let Some(failure) = test_event.parse_failure() {
-                        failures.push(failure);
+                NextestMessage::Test(test_event) => match &test_event {
+                    nextest::TestEvent::Ok { name, .. } => {
+                        passed_tests.push(name.clone());
                     }
-                }
+                    nextest::TestEvent::Failed { .. } => {
+                        if let Some(failure) = test_event.parse_failure() {
+                            failures.push(failure);
+                        }
+                    }
+                    nextest::TestEvent::Started { .. } => {}
+                },
             },
             Err(e) => {
                 // Log parse errors but continue - nextest might emit non-JSON lines
@@ -111,6 +120,7 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> Result<TestRun
 
     Ok(TestRunResult {
         failures,
+        passed_tests,
         total,
         passed,
         failed,
