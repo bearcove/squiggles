@@ -52,11 +52,13 @@ edition = "2021"
     let outcome = run_tests(crate_path, &config).await;
 
     match outcome {
-        RunOutcome::BuildFailed(stderr) => {
+        RunOutcome::BuildFailed(stderr, stats) => {
             assert!(
                 stderr.contains("error") || stderr.contains("unclosed"),
                 "Build failure should mention error: {stderr}"
             );
+            assert!(stats.elapsed_ms > 0, "Should have elapsed time");
+            assert!(stats.exit_code.is_some(), "Should have exit code");
         }
         other => panic!("Expected BuildFailed, got: {other:?}"),
     }
@@ -108,7 +110,7 @@ fn test_math() {
     let outcome = run_tests(crate_path, &config).await;
 
     match outcome {
-        RunOutcome::Tests(result) => {
+        RunOutcome::Tests(result, stats) => {
             assert_eq!(result.failed, 0, "No tests should fail");
             assert!(result.passed >= 2, "At least 2 tests should pass");
             assert!(result.failures.is_empty(), "No failures expected");
@@ -116,6 +118,8 @@ fn test_math() {
                 result.passed_tests.len() >= 2,
                 "Should track passed test names"
             );
+            assert!(stats.json_messages > 0, "Should have parsed JSON");
+            assert!(stats.exit_code == Some(0), "Should exit successfully");
         }
         other => panic!("Expected Tests, got: {other:?}"),
     }
@@ -143,7 +147,7 @@ async fn test_runner_with_failures() {
     let outcome = run_tests(&fixture, &config).await;
 
     match outcome {
-        RunOutcome::Tests(result) => {
+        RunOutcome::Tests(result, stats) => {
             assert!(result.failed > 0, "Should have failing tests");
             assert!(result.passed > 0, "Should have passing tests too");
             assert!(!result.failures.is_empty(), "Should have failure details");
@@ -156,6 +160,8 @@ async fn test_runner_with_failures() {
                     failure
                 );
             }
+
+            assert!(stats.json_messages > 0, "Should have parsed JSON");
         }
         other => panic!("Expected Tests with failures, got: {other:?}"),
     }
@@ -285,12 +291,13 @@ edition = "2021"
     assert!(result.is_ok(), "Runner should not hang");
 
     match result.unwrap() {
-        RunOutcome::Tests(r) => {
+        RunOutcome::Tests(r, stats) => {
             assert_eq!(r.total, 0, "Should have 0 tests");
             assert_eq!(r.failed, 0);
             assert_eq!(r.passed, 0);
+            assert!(stats.elapsed_ms > 0, "Should have elapsed time");
         }
-        RunOutcome::BuildFailed(_) => {
+        RunOutcome::BuildFailed(_, _) => {
             // Also acceptable - build might fail for other reasons
         }
         RunOutcome::ProcessFailed(msg) => {

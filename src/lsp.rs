@@ -738,7 +738,26 @@ async fn test_runner_loop(
     client: Client,
 ) {
     use crate::diagnostics::failures_to_diagnostics;
-    use crate::runner::{RunOutcome, run_tests};
+    use crate::runner::{RunOutcome, RunStats, run_tests};
+
+    /// Log run statistics to the client
+    async fn log_stats(client: &Client, stats: &RunStats) {
+        client
+            .log_message(
+                MessageType::LOG,
+                format!(
+                    "[squiggles] cmd={} cwd={} elapsed={}ms exit={:?} stdout={} stderr={} json={}",
+                    stats.command,
+                    stats.cwd,
+                    stats.elapsed_ms,
+                    stats.exit_code,
+                    stats.stdout_lines,
+                    stats.stderr_lines,
+                    stats.json_messages,
+                ),
+            )
+            .await;
+    }
 
     while rx.recv().await.is_some() {
         // Coalesce multiple rapid triggers into one run
@@ -768,12 +787,16 @@ async fn test_runner_loop(
                 .await;
 
         client
-            .log_message(MessageType::INFO, "Running tests...")
+            .log_message(
+                MessageType::INFO,
+                format!("Running tests in {}...", workspace_root.display()),
+            )
             .await;
 
         // Run tests - this always completes, never hangs
         match run_tests(&workspace_root, &config).await {
-            RunOutcome::Tests(result) => {
+            RunOutcome::Tests(result, stats) => {
+                log_stats(&client, &stats).await;
                 let summary = if result.failed == 0 {
                     format!("✓ {}/{} passed", result.passed, result.total)
                 } else {
@@ -849,7 +872,9 @@ async fn test_runner_loop(
                 // End progress with summary
                 progress.end(Some(summary)).await;
             }
-            RunOutcome::BuildFailed(stderr) => {
+            RunOutcome::BuildFailed(stderr, stats) => {
+                log_stats(&client, &stats).await;
+
                 // Build failed - show the error to the user
                 let first_line = stderr.lines().next().unwrap_or("Build failed");
                 let summary = format!("⚠ Build failed: {first_line}");
