@@ -233,26 +233,25 @@ fn parse_panic_header(stdout: &str) -> (String, Option<SourceLocation>) {
 /// 1. Single line: `Message:  {text}\n`
 /// 2. Multi-line: `Message:\n{multi-line content}\nLocation:`
 fn extract_color_backtrace_message(stdout: &str) -> String {
-    let Some(msg_idx) = stdout.find("Message:") else {
+    // Strip ANSI codes first - they interfere with boundary detection
+    let clean = strip_ansi_codes(stdout);
+
+    let Some(msg_idx) = clean.find("Message:") else {
         return String::new();
     };
 
-    let after_msg = &stdout[msg_idx + "Message:".len()..];
+    let after_msg = &clean[msg_idx + "Message:".len()..];
 
     // Find where the message ends (at "Location:" line)
-    let msg_end = after_msg.find("\nLocation:").unwrap_or(after_msg.len());
+    let msg_end = after_msg.find("Location:").unwrap_or(after_msg.len());
 
-    let raw_message = &after_msg[..msg_end];
+    let message = after_msg[..msg_end].trim();
 
-    // Strip ANSI codes and clean up
-    let clean = strip_ansi_codes(raw_message);
-    let trimmed = clean.trim();
-
-    if trimmed.is_empty() {
+    if message.is_empty() {
         return String::new();
     }
 
-    trimmed.to_string()
+    message.to_string()
 }
 
 /// Strip ANSI escape codes from a string.
