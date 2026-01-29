@@ -208,6 +208,20 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        let state = self.state.read().await;
+        let enabled = state.config.enabled;
+        drop(state);
+
+        if !enabled {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    "squiggles: disabled (create .config/squiggles/config.styx with {enabled true})",
+                )
+                .await;
+            return;
+        }
+
         self.client
             .log_message(MessageType::INFO, "squiggles LSP initialized")
             .await;

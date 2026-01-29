@@ -59,14 +59,7 @@ fn main() {
 }
 
 fn run_lsp(config: Config) {
-    if !config.enabled {
-        eprintln!("squiggles: not enabled (no config file or enabled = false)");
-        eprintln!("hint: create .config/squiggles/config.styx with:");
-        eprintln!("  {{enabled true}}");
-        return;
-    }
-
-    // Start the LSP server
+    // Start the LSP server (it handles enabled/disabled state internally)
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
