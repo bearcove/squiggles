@@ -166,46 +166,104 @@ impl TestEvent {
 
 /// Parse the panic header to extract message and location.
 ///
-/// Format: `thread '...' (...) panicked at {file}:{line}:{col}:\n{message}`
+/// Supports multiple formats:
+/// 1. Standard: `thread '...' (...) panicked at {file}:{line}:{col}:\n{message}`
+/// 2. color-backtrace: `Location: {file}:{line}\n` (no column)
 fn parse_panic_header(stdout: &str) -> (String, Option<SourceLocation>) {
-    // Look for "panicked at {file}:{line}:{col}:"
-    let Some(panicked_idx) = stdout.find("panicked at ") else {
-        return (String::new(), None);
-    };
+    // Try standard format first: "panicked at {file}:{line}:{col}:"
+    if let Some(panicked_idx) = stdout.find("panicked at ") {
+        let after_panicked = &stdout[panicked_idx + "panicked at ".len()..];
 
-    let after_panicked = &stdout[panicked_idx + "panicked at ".len()..];
+        // Find the colon after column number (before the message)
+        // Format: file:line:col:\nmessage
+        let mut colons = 0;
+        let mut location_end = 0;
+        for (i, c) in after_panicked.char_indices() {
+            if c == ':' {
+                colons += 1;
+                if colons == 3 {
+                    location_end = i;
+                    break;
+                }
+            }
+        }
 
-    // Find the colon after column number (before the message)
-    // Format: file:line:col:\nmessage
-    let mut colons = 0;
-    let mut location_end = 0;
-    for (i, c) in after_panicked.char_indices() {
-        if c == ':' {
-            colons += 1;
-            if colons == 3 {
-                location_end = i;
-                break;
+        if colons >= 3 {
+            let location_str = &after_panicked[..location_end];
+            let location = parse_location(location_str);
+
+            // Message is after the location, skip ":\n"
+            let message_start = location_end + 1;
+            let message = after_panicked
+                .get(message_start..)
+                .map(|s| s.trim_start_matches('\n'))
+                .and_then(|s| s.lines().next())
+                .unwrap_or("")
+                .to_string();
+
+            return (message, location);
+        }
+    }
+
+    // Try color-backtrace format: "Location: {file}:{line}\n"
+    // This format doesn't include column
+    if let Some(location_idx) = stdout.find("Location: ") {
+        let after_location = &stdout[location_idx + "Location: ".len()..];
+        // Strip ANSI codes - location might be colorized
+        let clean = strip_ansi_codes(after_location);
+
+        // Take until newline
+        if let Some(newline_idx) = clean.find('\n') {
+            let location_str = clean[..newline_idx].trim();
+            // Parse file:line format (no column)
+            if let Some(location) = parse_location_no_column(location_str) {
+                // Try to extract message from "Message:" if present
+                let message = if let Some(msg_idx) = stdout.find("Message:") {
+                    let after_msg = &stdout[msg_idx + "Message:".len()..];
+                    let clean_msg = strip_ansi_codes(after_msg);
+                    clean_msg.lines().next().unwrap_or("").trim().to_string()
+                } else {
+                    String::new()
+                };
+                return (message, Some(location));
             }
         }
     }
 
-    if colons < 3 {
-        return (String::new(), None);
+    (String::new(), None)
+}
+
+/// Strip ANSI escape codes from a string.
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_escape = false;
+
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c == 'm' {
+                in_escape = false;
+            }
+        } else {
+            result.push(c);
+        }
     }
 
-    let location_str = &after_panicked[..location_end];
-    let location = parse_location(location_str);
+    result
+}
 
-    // Message is after the location, skip ":\n"
-    let message_start = location_end + 1;
-    let message = after_panicked
-        .get(message_start..)
-        .map(|s| s.trim_start_matches('\n'))
-        .and_then(|s| s.lines().next())
-        .unwrap_or("")
-        .to_string();
+/// Parse a location string like "file:line" (no column).
+fn parse_location_no_column(s: &str) -> Option<SourceLocation> {
+    let colon_idx = s.rfind(':')?;
+    let file = s[..colon_idx].to_string();
+    let line: u32 = s[colon_idx + 1..].parse().ok()?;
 
-    (message, location)
+    Some(SourceLocation {
+        file,
+        line,
+        column: 1, // Default to column 1
+    })
 }
 
 /// Parse a location string like "src/lib.rs:10:5" or "./src/lib.rs:10:5"

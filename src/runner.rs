@@ -243,11 +243,23 @@ pub async fn run_tests_verbose(
                                 passed_tests.push(name.clone());
                                 format!("test:ok {name}")
                             }
-                            nextest::TestEvent::Failed { name, .. } => {
+                            nextest::TestEvent::Failed { name, stdout, .. } => {
                                 if let Some(failure) = test_event.parse_failure() {
+                                    let has_loc = failure.panic_location.is_some();
+                                    let loc_info = if let Some(ref loc) = failure.panic_location {
+                                        format!(" at {}:{}:{}", loc.file, loc.line, loc.column)
+                                    } else {
+                                        " (no panic location found)".to_string()
+                                    };
                                     failures.push(failure);
+                                    format!("test:failed {name}{loc_info}")
+                                } else {
+                                    // Log first 200 chars of stdout to help debug why we couldn't parse
+                                    let preview: String = stdout.chars().take(200).collect();
+                                    format!(
+                                        "test:failed {name} (parse_failure returned None, stdout preview: {preview})"
+                                    )
                                 }
-                                format!("test:failed {name}")
                             }
                             nextest::TestEvent::Started { name, .. } => {
                                 format!("test:started {name}")
