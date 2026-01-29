@@ -1252,8 +1252,13 @@ async fn test_runner_loop(
                 }
 
                 // Publish diagnostics for each file with failures
-                for (uri, diags) in diagnostics_by_file {
-                    client.publish_diagnostics(uri, diags, None).await;
+                // Also track these URIs so we can clear them later
+                {
+                    let mut state_guard = state.write().await;
+                    for (uri, diags) in diagnostics_by_file {
+                        state_guard.files_with_diagnostics.insert(uri.to_string());
+                        client.publish_diagnostics(uri, diags, None).await;
+                    }
                 }
 
                 // End progress with summary
