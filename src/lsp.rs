@@ -1367,10 +1367,47 @@ fn format_failure_hover(failure: &TestFailure, workspace_root: Option<&std::path
         }
     };
 
+    // Helper to find a file in the workspace by searching for it
+    fn find_file_recursive(dir: &Path, suffix: &Path, results: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Skip target and hidden dirs
+                    if path.is_dir() && (name == "target" || name.starts_with('.')) {
+                        continue;
+                    }
+                }
+                if path.is_dir() {
+                    find_file_recursive(&path, suffix, results);
+                } else if path.ends_with(suffix) {
+                    results.push(path);
+                }
+            }
+        }
+    }
+
+    let find_file = |file: &str| -> Option<std::path::PathBuf> {
+        // First try the direct path
+        let abs_path = absolute_path(file);
+        if Path::new(&abs_path).exists() {
+            return Some(abs_path.into());
+        }
+        // If not found and we have a workspace root, search for the file
+        if let Some(root) = workspace_root {
+            let suffix = Path::new(file);
+            let mut results = Vec::new();
+            find_file_recursive(root, suffix, &mut results);
+            // Return the first match (there should only be one)
+            return results.into_iter().next();
+        }
+        None
+    };
+
     // Helper to read a line from a file
     let read_line = |file: &str, line: u32| -> Option<String> {
-        let abs_path = absolute_path(file);
-        let content = std::fs::read_to_string(&abs_path).ok()?;
+        let path = find_file(file)?;
+        let content = std::fs::read_to_string(&path).ok()?;
         let line_content = content.lines().nth(line.saturating_sub(1) as usize)?;
         Some(line_content.trim().to_string())
     };

@@ -128,13 +128,9 @@ async fn debounce_loop(
 fn extract_saved_paths(event: &Event) -> Option<Vec<PathBuf>> {
     match event.kind {
         // File was modified (save)
-        EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
-            Some(event.paths.clone())
-        }
+        EventKind::Modify(notify::event::ModifyKind::Data(_)) => Some(event.paths.clone()),
         // File was created (new file)
-        EventKind::Create(notify::event::CreateKind::File) => {
-            Some(event.paths.clone())
-        }
+        EventKind::Create(notify::event::CreateKind::File) => Some(event.paths.clone()),
         _ => None,
     }
 }

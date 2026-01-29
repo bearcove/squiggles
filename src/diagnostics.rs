@@ -10,7 +10,7 @@ use crate::lsp::{Span, find_test_functions_detailed};
 use crate::nextest::{SourceLocation, TestFailure};
 
 /// Write debug info to /tmp/squiggles-debug.log
-fn debug_log(msg: &str) {
+pub fn debug_log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
