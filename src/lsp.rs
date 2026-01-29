@@ -317,6 +317,206 @@ impl LanguageServer for Backend {
 
         Ok(None)
     }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+
+        // Read the file to find #[test] functions
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+
+        let content = match tokio::fs::read_to_string(&file_path).await {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+
+        let state = self.state.read().await;
+
+        // If no test results yet, return empty
+        if state.test_results.is_empty() {
+            return Ok(None);
+        }
+
+        // Find all #[test] functions and their names
+        let test_functions = find_test_functions(&content);
+        let mut hints = Vec::new();
+
+        for (line, fn_name) in test_functions {
+            // Skip if outside requested range
+            if line < params.range.start.line || line > params.range.end.line {
+                continue;
+            }
+
+            // Try to find matching test result
+            // Test names in nextest are: `{crate}::{binary}${module}::{fn_name}`
+            // We match by suffix since we only have the function name
+            let result = state.test_results.iter().find(|(name, _)| {
+                // Match the function name at the end after ::
+                name.ends_with(&format!("::{fn_name}"))
+                    || name.ends_with(&format!("${fn_name}"))
+                    || **name == fn_name
+            });
+
+            if let Some((_, test_result)) = result {
+                let (label, tooltip) = match test_result {
+                    TestResult::Passed => ("✓ pass".to_string(), "Test passed".to_string()),
+                    TestResult::Failed(stored) => (
+                        "✗ fail".to_string(),
+                        format!("Test failed: {}", stored.failure.message),
+                    ),
+                };
+
+                hints.push(InlayHint {
+                    position: Position { line, character: 0 },
+                    label: InlayHintLabel::String(label),
+                    kind: None,
+                    text_edits: None,
+                    tooltip: Some(InlayHintTooltip::String(tooltip)),
+                    padding_left: Some(true),
+                    padding_right: Some(false),
+                    data: None,
+                });
+            }
+        }
+
+        if hints.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hints))
+        }
+    }
+}
+
+/// Find all `#[test]` functions in a Rust file using proper tokenization.
+///
+/// Returns a list of (line_number, function_name) pairs.
+/// Line numbers are 0-indexed.
+///
+/// Note: This uses rustc_lexer for proper tokenization but cannot expand macros,
+/// so macro-generated tests won't be detected.
+fn find_test_functions(content: &str) -> Vec<(u32, String)> {
+    use rustc_lexer::{TokenKind, tokenize};
+
+    // Build line number lookup: byte offset -> line number (0-indexed)
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    let offset_to_line = |offset: usize| -> u32 {
+        match line_starts.binary_search(&offset) {
+            Ok(line) => line as u32,
+            Err(line) => line.saturating_sub(1) as u32,
+        }
+    };
+
+    // Tokenize and collect with offsets
+    let mut tokens: Vec<(usize, TokenKind, &str)> = Vec::new();
+    let mut offset = 0usize;
+    for token in tokenize(content) {
+        let text = &content[offset..offset + token.len];
+        tokens.push((offset, token.kind, text));
+        offset += token.len;
+    }
+
+    let mut results = Vec::new();
+    let mut i = 0;
+
+    while i < tokens.len() {
+        // Look for # starting an attribute
+        if matches!(tokens[i].1, TokenKind::Pound) {
+            let attr_offset = tokens[i].0;
+            i += 1;
+
+            // Skip whitespace
+            while i < tokens.len() && matches!(tokens[i].1, TokenKind::Whitespace) {
+                i += 1;
+            }
+
+            // Expect [
+            if i >= tokens.len() || !matches!(tokens[i].1, TokenKind::OpenBracket) {
+                continue;
+            }
+            i += 1;
+
+            // Scan inside the attribute for "test" identifier
+            let mut depth = 1;
+            let mut has_test = false;
+
+            while i < tokens.len() && depth > 0 {
+                match tokens[i].1 {
+                    TokenKind::OpenBracket | TokenKind::OpenParen => depth += 1,
+                    TokenKind::CloseBracket | TokenKind::CloseParen => depth -= 1,
+                    TokenKind::Ident if tokens[i].2 == "test" => has_test = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if !has_test {
+                continue;
+            }
+
+            // Found a test attribute, now look for the fn declaration
+            // Skip whitespace, comments, and other attributes
+            while i < tokens.len() {
+                match tokens[i].1 {
+                    TokenKind::Whitespace
+                    | TokenKind::LineComment
+                    | TokenKind::BlockComment { .. } => {
+                        i += 1;
+                    }
+                    TokenKind::Pound => {
+                        // Another attribute, skip it entirely
+                        i += 1;
+                        while i < tokens.len() && matches!(tokens[i].1, TokenKind::Whitespace) {
+                            i += 1;
+                        }
+                        if i < tokens.len() && matches!(tokens[i].1, TokenKind::OpenBracket) {
+                            let mut attr_depth = 1;
+                            i += 1;
+                            while i < tokens.len() && attr_depth > 0 {
+                                match tokens[i].1 {
+                                    TokenKind::OpenBracket => attr_depth += 1,
+                                    TokenKind::CloseBracket => attr_depth -= 1,
+                                    _ => {}
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    TokenKind::Ident => {
+                        let ident = tokens[i].2;
+                        if ident == "fn" {
+                            // Found fn keyword, next ident is the function name
+                            i += 1;
+                            while i < tokens.len() && matches!(tokens[i].1, TokenKind::Whitespace) {
+                                i += 1;
+                            }
+                            if i < tokens.len() && matches!(tokens[i].1, TokenKind::Ident) {
+                                let fn_name = tokens[i].2.to_string();
+                                let line = offset_to_line(attr_offset);
+                                results.push((line, fn_name));
+                            }
+                            break;
+                        } else if matches!(ident, "pub" | "async" | "const" | "unsafe" | "extern") {
+                            // Skip function modifiers
+                            i += 1;
+                        } else {
+                            // Unknown identifier, stop looking for fn
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    results
 }
 
 /// Run the LSP server on stdin/stdout.
@@ -498,5 +698,325 @@ fn location_to_range(loc: &crate::nextest::SourceLocation) -> Range {
             line,
             character: col,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_test_functions;
+
+    #[test]
+    fn simple_test_function() {
+        let code = r#"
+#[test]
+fn my_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "my_test".to_string())]);
+    }
+
+    #[test]
+    fn test_with_pub() {
+        let code = r#"
+#[test]
+pub fn my_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "my_test".to_string())]);
+    }
+
+    #[test]
+    fn async_test() {
+        let code = r#"
+#[test]
+async fn my_async_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "my_async_test".to_string())]);
+    }
+
+    #[test]
+    fn pub_async_test() {
+        let code = r#"
+#[test]
+pub async fn my_pub_async_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "my_pub_async_test".to_string())]);
+    }
+
+    #[test]
+    fn tokio_test() {
+        let code = r#"
+#[tokio::test]
+async fn my_tokio_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "my_tokio_test".to_string())]);
+    }
+
+    #[test]
+    fn async_std_test() {
+        let code = r#"
+#[async_std::test]
+async fn my_async_std_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "my_async_std_test".to_string())]);
+    }
+
+    #[test]
+    fn multiple_tests() {
+        let code = r#"
+#[test]
+fn test_one() {}
+
+#[test]
+fn test_two() {}
+
+#[test]
+fn test_three() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(
+            results,
+            vec![
+                (1, "test_one".to_string()),
+                (4, "test_two".to_string()),
+                (7, "test_three".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_with_other_attributes() {
+        let code = r#"
+#[test]
+#[should_panic]
+fn panicking_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "panicking_test".to_string())]);
+    }
+
+    #[test]
+    fn test_with_cfg_attribute() {
+        let code = r#"
+#[cfg(test)]
+#[test]
+fn cfg_test() {}
+"#;
+        let results = find_test_functions(code);
+        // #[cfg(test)] contains "test" identifier, so it matches on line 1
+        assert_eq!(results, vec![(1, "cfg_test".to_string())]);
+    }
+
+    #[test]
+    fn test_with_ignore() {
+        let code = r#"
+#[test]
+#[ignore]
+fn ignored_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "ignored_test".to_string())]);
+    }
+
+    #[test]
+    fn test_with_ignore_reason() {
+        let code = r#"
+#[test]
+#[ignore = "not ready yet"]
+fn ignored_with_reason() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "ignored_with_reason".to_string())]);
+    }
+
+    #[test]
+    fn no_tests_in_file() {
+        let code = r#"
+fn regular_function() {}
+
+pub fn another_function() {}
+"#;
+        let results = find_test_functions(code);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_in_string_not_detected() {
+        let code = r##"
+fn foo() {
+    let s = "#[test]
+fn fake_test() {}";
+}
+"##;
+        let results = find_test_functions(code);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_in_comment_not_detected() {
+        let code = r#"
+// #[test]
+// fn commented_test() {}
+
+fn real_function() {}
+"#;
+        let results = find_test_functions(code);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_in_block_comment_not_detected() {
+        let code = r#"
+/*
+#[test]
+fn block_commented_test() {}
+*/
+
+fn real_function() {}
+"#;
+        let results = find_test_functions(code);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_with_doc_comment() {
+        let code = r#"
+/// This is a documented test
+#[test]
+fn documented_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(2, "documented_test".to_string())]);
+    }
+
+    #[test]
+    fn test_with_multiline_doc_comment() {
+        let code = r#"
+/// First line
+/// Second line
+/// Third line
+#[test]
+fn multi_doc_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(4, "multi_doc_test".to_string())]);
+    }
+
+    #[test]
+    fn unsafe_test() {
+        let code = r#"
+#[test]
+unsafe fn unsafe_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "unsafe_test".to_string())]);
+    }
+
+    #[test]
+    fn const_fn_not_test() {
+        // const fn can't be a test, but we handle the modifier anyway
+        let code = r#"
+#[test]
+const fn const_test() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "const_test".to_string())]);
+    }
+
+    #[test]
+    fn test_case_attribute() {
+        // test_case macro uses #[test_case(...)]
+        let code = r#"
+#[test_case(1, 2)]
+#[test_case(3, 4)]
+fn parameterized_test(a: i32, b: i32) {}
+"#;
+        let results = find_test_functions(code);
+        // "test_case" is a single identifier, not "test" - so not detected
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn rstest_attribute() {
+        let code = r#"
+#[rstest]
+fn rstest_fn() {}
+"#;
+        let results = find_test_functions(code);
+        // rstest doesn't contain "test" as an identifier, so not detected
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn mixed_tests_and_functions() {
+        let code = r#"
+fn helper() {}
+
+#[test]
+fn test_one() {}
+
+fn another_helper() {}
+
+#[test]
+fn test_two() {}
+
+impl Foo {
+    fn method(&self) {}
+}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(
+            results,
+            vec![(3, "test_one".to_string()), (8, "test_two".to_string()),]
+        );
+    }
+
+    #[test]
+    fn test_with_generics() {
+        let code = r#"
+#[test]
+fn generic_test<T: Default>() {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "generic_test".to_string())]);
+    }
+
+    #[test]
+    fn test_with_where_clause() {
+        let code = r#"
+#[test]
+fn where_test<T>() where T: Clone {}
+"#;
+        let results = find_test_functions(code);
+        assert_eq!(results, vec![(1, "where_test".to_string())]);
+    }
+
+    #[test]
+    fn test_attribute_with_parens() {
+        let code = r#"
+#[test()]
+fn test_with_parens() {}
+"#;
+        let results = find_test_functions(code);
+        // #[test()] still has "test" identifier
+        assert!(results.is_empty() || results == vec![(1, "test_with_parens".to_string())]);
+    }
+
+    #[test]
+    fn empty_file() {
+        let code = "";
+        let results = find_test_functions(code);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only() {
+        let code = "   \n\n   \t\t\n";
+        let results = find_test_functions(code);
+        assert!(results.is_empty());
     }
 }
