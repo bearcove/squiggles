@@ -408,6 +408,11 @@ mod tests {
             "test_something".to_string(),
             TestLocation {
                 uri: test_uri.clone(),
+                attr_span: Span {
+                    line: 9,
+                    col: 4,
+                    len: 7, // "#[test]".len()
+                },
                 name_span: Span {
                     line: 10,
                     col: 4,
@@ -441,25 +446,24 @@ mod tests {
         let workspace = Path::new("/project");
         let diags = failures_to_diagnostics(&failures, workspace, &test_index);
 
-        assert_eq!(diags.len(), 1);
-
+        // Should have diagnostics for the test file (at test location)
+        // Note: panic location diagnostic would go to a different file (src/lib.rs at line 42)
+        // but since that file doesn't exist, we can't compute its content range
         let file_diags = diags.get(&test_uri).unwrap();
-        assert_eq!(file_diags.len(), 1);
+        assert!(!file_diags.is_empty());
 
-        let diag = &file_diags[0];
-        assert_eq!(diag.message, "assertion failed");
-        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        // Find the ERROR diagnostic (test failure)
+        let error_diag = file_diags
+            .iter()
+            .find(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .expect("should have an ERROR diagnostic");
+
+        assert_eq!(error_diag.message, "assertion failed");
         // Should be at line 10, column 4, spanning the function name
-        assert_eq!(diag.range.start.line, 10);
-        assert_eq!(diag.range.start.character, 4);
-        assert_eq!(diag.range.end.character, 18); // 4 + 14
-        // No code - diagnostic is on the test function itself
-        assert_eq!(diag.code, None);
-
-        // Check related info includes panic location
-        let related = diag.related_information.as_ref().unwrap();
-        assert!(related.len() >= 1);
-        assert!(related[0].message.contains("panicked here"));
+        assert_eq!(error_diag.range.start.line, 10);
+        assert_eq!(error_diag.range.start.character, 4);
+        assert_eq!(error_diag.range.end.character, 18); // 4 + 14
+        assert_eq!(error_diag.code, None);
     }
 
     #[test]

@@ -563,6 +563,56 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+
+        // Get diagnostics we've already computed for this file
+        let state = self.state.read().await;
+
+        // Collect diagnostics for this URI from our stored failures
+        let mut items = Vec::new();
+
+        for stored in state.failures.get(&uri.to_string()).into_iter().flatten() {
+            // Build the message (first line only for the diagnostic)
+            let message = if !stored.failure.message.is_empty() {
+                stored
+                    .failure
+                    .message
+                    .lines()
+                    .next()
+                    .unwrap_or("Test failed")
+                    .to_string()
+            } else {
+                "Test failed".to_string()
+            };
+
+            items.push(Diagnostic {
+                range: stored.range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                code: None,
+                code_description: None,
+                source: Some("squiggles".to_string()),
+                message,
+                related_information: None,
+                tags: None,
+                data: None,
+            });
+        }
+
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items,
+                },
+            }),
+        ))
+    }
+
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
 
@@ -1791,7 +1841,7 @@ fn test_with_parens() {}
             assert!(hover.contains("**Backtrace:**"));
             assert!(hover.contains("#14"));
             assert!(hover.contains("`inner_fn`"));
-            assert!(hover.contains("./src/helper.rs:20"));
+            assert!(hover.contains("src/helper.rs:20")); // relative_path strips ./
         }
 
         #[test]
