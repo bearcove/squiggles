@@ -24,11 +24,38 @@ pub struct TestRunResult {
     pub failed: u32,
 }
 
+/// The current phase of the test run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPhase {
+    /// Starting up, spawning process.
+    Starting,
+    /// Compiling the project.
+    Compiling,
+    /// Running tests.
+    Testing,
+    /// Completed (successfully or with test failures).
+    Done,
+}
+
+/// Outcome of a test run - either success/test failures, or a build/run error.
+#[derive(Debug)]
+pub enum RunOutcome {
+    /// Tests ran (possibly with failures).
+    Tests(TestRunResult),
+    /// Build failed - contains stderr output.
+    BuildFailed(String),
+    /// Process failed to start or crashed.
+    ProcessFailed(String),
+}
+
 /// Run tests and collect failures.
 ///
 /// Spawns `cargo nextest run` with JSON output and parses the streaming results.
 /// Respects include/exclude filters from config.
-pub async fn run_tests(workspace_root: &Path, config: &Config) -> Result<TestRunResult, RunError> {
+///
+/// This function reads both stdout and stderr concurrently, so it won't hang
+/// even if the build fails and produces no JSON output.
+pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
     let mut cmd = Command::new("cargo");
     cmd.arg("nextest")
         .arg("run")
@@ -52,79 +79,149 @@ pub async fn run_tests(workspace_root: &Path, config: &Config) -> Result<TestRun
         }
     }
 
-    let mut child = cmd.spawn().map_err(|e| RunError::Spawn(e.to_string()))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return RunOutcome::ProcessFailed(format!("failed to spawn cargo nextest: {e}"));
+        }
+    };
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| RunError::Spawn("failed to capture stdout".to_string()))?;
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            return RunOutcome::ProcessFailed("failed to capture stdout".to_string());
+        }
+    };
 
-    let mut reader = BufReader::new(stdout).lines();
-    let mut failures = Vec::new();
-    let mut passed_tests = Vec::new();
-    let mut total = 0u32;
-    let mut passed = 0u32;
-    let mut failed = 0u32;
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            return RunOutcome::ProcessFailed("failed to capture stderr".to_string());
+        }
+    };
 
-    while let Some(line) = reader.next_line().await.map_err(RunError::Io)? {
-        match nextest::parse_message(&line) {
-            Ok(msg) => match msg {
-                NextestMessage::Suite(suite_event) => {
-                    // Extract final counts from suite finished event
-                    match suite_event {
-                        crate::nextest::SuiteEvent::Started { test_count, .. } => {
-                            total = test_count;
-                        }
-                        crate::nextest::SuiteEvent::Failed {
-                            passed: p,
-                            failed: f,
-                            ..
-                        }
-                        | crate::nextest::SuiteEvent::Ok {
-                            passed: p,
-                            failed: f,
-                            ..
-                        } => {
-                            passed = p;
-                            failed = f;
-                        }
+    // Read stdout and stderr concurrently
+    let stdout_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout).lines();
+        let mut failures = Vec::new();
+        let mut passed_tests = Vec::new();
+        let mut total = 0u32;
+        let mut passed = 0u32;
+        let mut failed = 0u32;
+        let mut got_any_json = false;
+
+        while let Ok(Some(line)) = reader.next_line().await {
+            match nextest::parse_message(&line) {
+                Ok(msg) => {
+                    got_any_json = true;
+                    match msg {
+                        NextestMessage::Suite(suite_event) => match suite_event {
+                            crate::nextest::SuiteEvent::Started { test_count, .. } => {
+                                total = test_count;
+                            }
+                            crate::nextest::SuiteEvent::Failed {
+                                passed: p,
+                                failed: f,
+                                ..
+                            }
+                            | crate::nextest::SuiteEvent::Ok {
+                                passed: p,
+                                failed: f,
+                                ..
+                            } => {
+                                passed = p;
+                                failed = f;
+                            }
+                        },
+                        NextestMessage::Test(test_event) => match &test_event {
+                            nextest::TestEvent::Ok { name, .. } => {
+                                passed_tests.push(name.clone());
+                            }
+                            nextest::TestEvent::Failed { .. } => {
+                                if let Some(failure) = test_event.parse_failure() {
+                                    failures.push(failure);
+                                }
+                            }
+                            nextest::TestEvent::Started { .. } => {}
+                        },
                     }
                 }
-                NextestMessage::Test(test_event) => match &test_event {
-                    nextest::TestEvent::Ok { name, .. } => {
-                        passed_tests.push(name.clone());
-                    }
-                    nextest::TestEvent::Failed { .. } => {
-                        if let Some(failure) = test_event.parse_failure() {
-                            failures.push(failure);
-                        }
-                    }
-                    nextest::TestEvent::Started { .. } => {}
-                },
-            },
-            Err(e) => {
-                // Log parse errors but continue - nextest might emit non-JSON lines
-                tracing::warn!("Failed to parse nextest output: {e}");
+                Err(_) => {
+                    // Non-JSON line, ignore (could be cargo output)
+                }
             }
         }
+
+        (
+            TestRunResult {
+                failures,
+                passed_tests,
+                total,
+                passed,
+                failed,
+            },
+            got_any_json,
+        )
+    });
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        let mut stderr_output = String::new();
+
+        while let Ok(Some(line)) = reader.next_line().await {
+            if !stderr_output.is_empty() {
+                stderr_output.push('\n');
+            }
+            stderr_output.push_str(&line);
+        }
+
+        stderr_output
+    });
+
+    // Wait for both to complete
+    let (stdout_result, stderr_result) = tokio::join!(stdout_handle, stderr_handle);
+
+    let (test_result, got_json) = stdout_result.unwrap_or_else(|_| {
+        (
+            TestRunResult {
+                failures: vec![],
+                passed_tests: vec![],
+                total: 0,
+                passed: 0,
+                failed: 0,
+            },
+            false,
+        )
+    });
+
+    let stderr_output = stderr_result.unwrap_or_default();
+
+    // Wait for process to finish
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            return RunOutcome::ProcessFailed(format!("failed to wait for process: {e}"));
+        }
+    };
+
+    // Determine outcome based on what we got
+    if got_json {
+        // We got JSON output, so tests ran (even if some failed)
+        RunOutcome::Tests(test_result)
+    } else if !status.success() {
+        // No JSON and non-zero exit - build failed
+        if stderr_output.is_empty() {
+            RunOutcome::BuildFailed(format!(
+                "cargo nextest exited with code {:?} but produced no output",
+                status.code()
+            ))
+        } else {
+            RunOutcome::BuildFailed(stderr_output)
+        }
+    } else {
+        // Success but no JSON? Weird, but return empty result
+        RunOutcome::Tests(test_result)
     }
-
-    // Wait for the process to finish
-    let status = child.wait().await.map_err(RunError::Io)?;
-
-    // Non-zero exit is expected when tests fail - that's the whole point!
-    // Only treat it as an error if we got no output at all
-    if !status.success() && failures.is_empty() && total == 0 {
-        return Err(RunError::NexTestFailed(status.code()));
-    }
-
-    Ok(TestRunResult {
-        failures,
-        passed_tests,
-        total,
-        passed,
-        failed,
-    })
 }
 
 /// Build a nextest filter expression from include/exclude patterns.
@@ -183,35 +280,6 @@ fn glob_to_regex(glob: &str) -> String {
     regex.push('/');
     regex
 }
-
-/// Errors that can occur during test runs.
-#[derive(Debug)]
-pub enum RunError {
-    /// Failed to spawn the nextest process.
-    Spawn(String),
-    /// IO error reading output.
-    Io(std::io::Error),
-    /// Nextest exited with an error (and no test output).
-    NexTestFailed(Option<i32>),
-}
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RunError::Spawn(msg) => write!(f, "failed to spawn nextest: {msg}"),
-            RunError::Io(e) => write!(f, "IO error: {e}"),
-            RunError::NexTestFailed(code) => {
-                if let Some(code) = code {
-                    write!(f, "nextest failed with exit code {code}")
-                } else {
-                    write!(f, "nextest failed (killed by signal)")
-                }
-            }
-        }
-    }
-}
-
-impl std::error::Error for RunError {}
 
 #[cfg(test)]
 mod tests {

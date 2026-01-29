@@ -738,7 +738,7 @@ async fn test_runner_loop(
     client: Client,
 ) {
     use crate::diagnostics::failures_to_diagnostics;
-    use crate::runner::run_tests;
+    use crate::runner::{RunOutcome, run_tests};
 
     while rx.recv().await.is_some() {
         // Coalesce multiple rapid triggers into one run
@@ -771,9 +771,9 @@ async fn test_runner_loop(
             .log_message(MessageType::INFO, "Running tests...")
             .await;
 
-        // Run tests
+        // Run tests - this always completes, never hangs
         match run_tests(&workspace_root, &config).await {
-            Ok(result) => {
+            RunOutcome::Tests(result) => {
                 let summary = if result.failed == 0 {
                     format!("✓ {}/{} passed", result.passed, result.total)
                 } else {
@@ -849,11 +849,52 @@ async fn test_runner_loop(
                 // End progress with summary
                 progress.end(Some(summary)).await;
             }
-            Err(e) => {
+            RunOutcome::BuildFailed(stderr) => {
+                // Build failed - show the error to the user
+                let first_line = stderr.lines().next().unwrap_or("Build failed");
+                let summary = format!("⚠ Build failed: {first_line}");
+
                 client
-                    .log_message(MessageType::ERROR, format!("Test run failed: {e}"))
+                    .log_message(MessageType::ERROR, format!("Build failed:\n{stderr}"))
                     .await;
-                progress.end(Some(format!("Error: {e}"))).await;
+
+                // Clear all test results since we couldn't run tests
+                {
+                    let mut state_guard = state.write().await;
+                    state_guard.test_results.clear();
+                    // Clear stored failures too
+                    let stale_uris = state_guard.store_failures(vec![]);
+                    drop(state_guard);
+
+                    // Clear diagnostics from all files that had them
+                    for uri in stale_uris {
+                        client.publish_diagnostics(uri, vec![], None).await;
+                    }
+                }
+
+                progress.end(Some(summary)).await;
+            }
+            RunOutcome::ProcessFailed(msg) => {
+                // Process failed to start or crashed
+                let summary = format!("⚠ {msg}");
+
+                client
+                    .log_message(MessageType::ERROR, format!("Process failed: {msg}"))
+                    .await;
+
+                // Clear all test results
+                {
+                    let mut state_guard = state.write().await;
+                    state_guard.test_results.clear();
+                    let stale_uris = state_guard.store_failures(vec![]);
+                    drop(state_guard);
+
+                    for uri in stale_uris {
+                        client.publish_diagnostics(uri, vec![], None).await;
+                    }
+                }
+
+                progress.end(Some(summary)).await;
             }
         }
     }
