@@ -431,23 +431,86 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        let state = self.state.read().await;
-        let enabled = state.config.enabled;
-        let workspace_root = state.workspace_root.clone();
-        drop(state);
+        let workspace_root = {
+            let state = self.state.read().await;
+            state.workspace_root.clone()
+        };
+
+        let Some(workspace_root) = workspace_root else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "squiggles: no workspace root, cannot load config",
+                )
+                .await;
+            return;
+        };
+
+        // Try to load config from workspace root
+        let config_path = workspace_root.join(".config/squiggles/config.styx");
+        let config = if config_path.exists() {
+            match tokio::fs::read_to_string(&config_path).await {
+                Ok(content) => match facet_styx::from_str::<crate::config::Config>(&content) {
+                    Ok(config) => {
+                        self.client
+                            .log_message(
+                                MessageType::INFO,
+                                format!("squiggles: loaded config from {}", config_path.display()),
+                            )
+                            .await;
+                        Some(config)
+                    }
+                    Err(e) => {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!(
+                                    "squiggles: failed to parse {}: {e}",
+                                    config_path.display()
+                                ),
+                            )
+                            .await;
+                        None
+                    }
+                },
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("squiggles: failed to read {}: {e}", config_path.display()),
+                        )
+                        .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Update state with loaded config
+        if let Some(config) = config {
+            let mut state = self.state.write().await;
+            state.config = config;
+        }
+
+        let enabled = {
+            let state = self.state.read().await;
+            state.config.enabled
+        };
 
         if !enabled {
             self.client
                 .log_message(
                     MessageType::INFO,
-                    "squiggles: disabled (create .config/squiggles/config.styx with {enabled true})",
+                    format!(
+                        "squiggles: disabled (create {} with {{enabled true}})",
+                        config_path.display()
+                    ),
                 )
                 .await;
 
             // Watch for config file to appear
-            if let Some(root) = workspace_root {
-                self.watch_for_config(root).await;
-            }
+            self.watch_for_config(workspace_root).await;
             return;
         }
 
