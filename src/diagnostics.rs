@@ -107,16 +107,14 @@ pub fn failures_to_diagnostics(
 
     // Track panic locations: (uri, line) -> list of test names
     let mut panic_locations: HashMap<(String, u32), Vec<String>> = HashMap::new();
-    // Track backtrace frames: (uri, line) -> list of test names
-    let mut frame_locations: HashMap<(String, u32), Vec<String>> = HashMap::new();
 
     for failure in failures {
         let short_name = extract_test_name(&failure.name);
 
         // Try to find the test function location
         let (uri, range) = if let Some(loc) = test_index.get(&short_name) {
-            // Found the test function - highlight the #[test] attribute
-            (loc.uri.clone(), loc.attr_span.to_range())
+            // Found the test function - highlight the function name
+            (loc.uri.clone(), loc.name_span.to_range())
         } else if let Some(ref panic_loc) = failure.panic_location {
             // Fall back to panic location if we can't find the test
             let file_path = resolve_path(&panic_loc.file, workspace_root);
@@ -161,18 +159,6 @@ pub fn failures_to_diagnostics(
             .or_default()
             .push(primary_diagnostic);
 
-        // Collect backtrace frame locations for deduplication
-        for frame in &failure.user_frames {
-            let frame_path = resolve_path(&frame.location.file, workspace_root);
-            if let Ok(frame_uri) = Url::from_file_path(&frame_path) {
-                let key = (frame_uri.to_string(), frame.location.line);
-                frame_locations
-                    .entry(key)
-                    .or_default()
-                    .push(short_name.clone());
-            }
-        }
-
         // Collect panic location for deduplication
         if let Some(ref panic_loc) = failure.panic_location {
             let panic_path = resolve_path(&panic_loc.file, workspace_root);
@@ -189,48 +175,6 @@ pub fn failures_to_diagnostics(
                 }
             }
         }
-    }
-
-    // Emit deduplicated HINT diagnostics for backtrace frames
-    for ((uri_str, line), test_names) in frame_locations {
-        let uri = match Url::parse(&uri_str) {
-            Ok(u) => u,
-            Err(_) => continue,
-        };
-        let file_path = match uri.to_file_path() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let frame_range = line_content_range(&file_path, line).unwrap_or_else(|| Range {
-            start: Position {
-                line: line.saturating_sub(1),
-                character: 0,
-            },
-            end: Position {
-                line: line.saturating_sub(1),
-                character: 0,
-            },
-        });
-
-        let message = if test_names.len() == 1 {
-            format!("in call stack for `{}`", test_names[0])
-        } else {
-            format!("in call stack for {} tests", test_names.len())
-        };
-
-        let frame_diagnostic = Diagnostic {
-            range: frame_range,
-            severity: Some(DiagnosticSeverity::HINT),
-            code: None,
-            code_description: None,
-            source: Some("squiggles".to_string()),
-            message,
-            related_information: None,
-            tags: None,
-            data: None,
-        };
-        diagnostics.entry(uri).or_default().push(frame_diagnostic);
     }
 
     // Emit deduplicated WARNING diagnostics for panic locations

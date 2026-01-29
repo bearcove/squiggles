@@ -643,7 +643,62 @@ impl LanguageServer for Backend {
                             data: None,
                         });
 
-                        // Backtrace frames are now shown as separate diagnostics, not inlay hints
+                        // Full error message above the #[test] attribute
+                        // (without backtrace, just the message)
+                        if !stored.failure.message.is_empty() {
+                            // Match the indentation of the #[test] attribute
+                            let indent = " ".repeat(info.attr_span.col as usize);
+                            // Wavy vertical border characters
+                            let wavy = ["│", "╎", "┊", "╏", "┆"];
+
+                            // Format the message with proper indentation and wavy left border
+                            let formatted_lines: Vec<String> = stored
+                                .failure
+                                .message
+                                .lines()
+                                .enumerate()
+                                .map(|(i, line)| {
+                                    let border = wavy[i % wavy.len()];
+                                    format!("{}{}  {}", indent, border, line)
+                                })
+                                .collect();
+
+                            // Find the longest line to size the waves
+                            let max_len = formatted_lines
+                                .iter()
+                                .map(|l| l.chars().count())
+                                .max()
+                                .unwrap_or(40)
+                                .max(50); // minimum width
+
+                            // Calculate line length for box drawing
+                            let wave_len = max_len.saturating_sub(indent.len() + 6);
+
+                            // Build the full hint with box drawing top/bottom
+                            let hint_text = format!(
+                                "{}╭─ FAILED {}\n{}\n{}│  (hover function name for full backtrace)\n{}╰{}\n",
+                                indent,
+                                "─".repeat(wave_len),
+                                formatted_lines.join("\n"),
+                                indent,
+                                indent,
+                                "─".repeat(wave_len + 9) // +9 for " FAILED "
+                            );
+
+                            hints.push(InlayHint {
+                                position: Position {
+                                    line: info.attr_span.line,
+                                    character: 0,
+                                },
+                                label: InlayHintLabel::String(hint_text),
+                                kind: None,
+                                text_edits: None,
+                                tooltip: None,
+                                padding_left: Some(false),
+                                padding_right: Some(false),
+                                data: None,
+                            });
+                        }
                     }
                 }
             }
@@ -1070,7 +1125,7 @@ async fn test_runner_loop(
                                     loc.uri.clone(),
                                     StoredFailure {
                                         failure: f.clone(),
-                                        range: loc.attr_span.to_range(),
+                                        range: loc.name_span.to_range(),
                                     },
                                 ))
                             } else if let Some(loc) = f.panic_location.as_ref() {
@@ -1089,27 +1144,26 @@ async fn test_runner_loop(
                         })
                         .collect();
 
-                    // Store all test results for inlay hints
-                    state_guard.test_results.clear();
+                    // Build new test results map first, then swap atomically
+                    // (avoids clearing results while inlay hints might be requested)
+                    let mut new_test_results = HashMap::new();
                     for name in &result.passed_tests {
-                        state_guard
-                            .test_results
-                            .insert(name.clone(), TestResult::Passed);
+                        new_test_results.insert(name.clone(), TestResult::Passed);
                     }
                     for failure in &result.failures {
                         let short_name = extract_test_name(&failure.name);
                         if let Some(test_loc) = test_index.get(&short_name) {
-                            state_guard.test_results.insert(
+                            new_test_results.insert(
                                 failure.name.clone(),
                                 TestResult::Failed(StoredFailure {
                                     failure: failure.clone(),
-                                    range: test_loc.attr_span.to_range(),
+                                    range: test_loc.name_span.to_range(),
                                 }),
                             );
                         } else if let Some(loc) = &failure.panic_location {
                             let file_path = resolve_path(&loc.file, &workspace_root);
                             if let Ok(_uri) = Url::from_file_path(&file_path) {
-                                state_guard.test_results.insert(
+                                new_test_results.insert(
                                     failure.name.clone(),
                                     TestResult::Failed(StoredFailure {
                                         failure: failure.clone(),
@@ -1119,6 +1173,8 @@ async fn test_runner_loop(
                             }
                         }
                     }
+                    // Atomic swap
+                    state_guard.test_results = new_test_results;
 
                     state_guard.store_failures(stored)
                 };
