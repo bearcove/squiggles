@@ -150,13 +150,20 @@ pub fn failures_to_diagnostics(
             }
         }
 
+        // Build a useful message - if empty, say "test failed"
+        let message = if failure.message.is_empty() {
+            "test failed".to_string()
+        } else {
+            failure.message.clone()
+        };
+
         let diagnostic = Diagnostic {
             range,
             severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String(short_name)),
+            code: None, // No code needed - the diagnostic is on the test function itself
             code_description: None,
             source: Some("squiggles".to_string()),
-            message: failure.message.clone(),
+            message,
             related_information: if related_info.is_empty() {
                 None
             } else {
@@ -302,10 +309,8 @@ mod tests {
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
         // Should be at line 10 (the test function), not line 41 (the panic)
         assert_eq!(diag.range.start.line, 10);
-        assert_eq!(
-            diag.code,
-            Some(NumberOrString::String("test_something".to_string()))
-        );
+        // No code - diagnostic is on the test function itself
+        assert_eq!(diag.code, None);
 
         // Check related info includes panic location
         let related = diag.related_information.as_ref().unwrap();
