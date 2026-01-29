@@ -2,15 +2,8 @@ use facet::Facet;
 use facet_styx::StyxFormat;
 use figue as args;
 
-mod config;
-mod diagnostics;
-mod lsp;
-mod nextest;
-mod progress;
-mod runner;
-mod watcher;
-
-use config::Config;
+use squiggles::config::Config;
+use squiggles::lsp;
 
 /// Subcommands for squiggles.
 #[derive(Facet, Debug)]

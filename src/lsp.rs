@@ -581,7 +581,7 @@ impl LanguageServer for Backend {
 ///
 /// Note: This uses rustc_lexer for proper tokenization but cannot expand macros,
 /// so macro-generated tests won't be detected.
-fn find_test_functions(content: &str) -> Vec<(u32, String)> {
+pub fn find_test_functions(content: &str) -> Vec<(u32, String)> {
     use rustc_lexer::{TokenKind, tokenize};
 
     // Build line number lookup: byte offset -> line number (0-indexed)
