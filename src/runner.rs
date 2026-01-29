@@ -207,26 +207,35 @@ pub async fn run_tests_verbose(
                     let description = match &msg {
                         NextestMessage::Suite(suite_event) => match suite_event {
                             crate::nextest::SuiteEvent::Started { test_count, .. } => {
-                                total = *test_count;
-                                format!("suite:started test_count={test_count}")
+                                // Accumulate test counts from all binaries
+                                total += *test_count;
+                                format!(
+                                    "suite:started test_count={test_count} (total now: {total})"
+                                )
                             }
                             crate::nextest::SuiteEvent::Failed {
                                 passed: p,
                                 failed: f,
                                 ..
                             } => {
-                                passed = *p;
-                                failed = *f;
-                                format!("suite:failed passed={p} failed={f}")
+                                // Accumulate results from all binaries
+                                passed += *p;
+                                failed += *f;
+                                format!(
+                                    "suite:failed passed={p} failed={f} (totals: passed={passed} failed={failed})"
+                                )
                             }
                             crate::nextest::SuiteEvent::Ok {
                                 passed: p,
                                 failed: f,
                                 ..
                             } => {
-                                passed = *p;
-                                failed = *f;
-                                format!("suite:ok passed={p} failed={f}")
+                                // Accumulate results from all binaries
+                                passed += *p;
+                                failed += *f;
+                                format!(
+                                    "suite:ok passed={p} failed={f} (totals: passed={passed} failed={failed})"
+                                )
                             }
                         },
                         NextestMessage::Test(test_event) => match test_event {
