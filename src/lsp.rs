@@ -855,10 +855,31 @@ async fn test_runner_loop(
                             .log_message(MessageType::LOG, format!("[squiggles] stdout: {status}"))
                             .await;
                     }
-                    RunLogEvent::Stderr { line } => {
+                    RunLogEvent::Stderr { line, progress } => {
+                        // Log the raw line
                         log_client
                             .log_message(MessageType::LOG, format!("[squiggles] stderr: {line}"))
                             .await;
+
+                        // If we parsed build progress, log it more prominently
+                        if let Some(prog) = progress {
+                            use crate::runner::BuildProgress;
+                            let msg = match prog {
+                                BuildProgress::Compiling { krate } => {
+                                    format!("Building {krate}...")
+                                }
+                                BuildProgress::WaitingForLock { target } => {
+                                    format!("Waiting for lock on {target}...")
+                                }
+                                BuildProgress::Finished => "Build finished".to_string(),
+                                BuildProgress::StartingTests { count } => {
+                                    format!("Running {count} tests...")
+                                }
+                            };
+                            log_client
+                                .log_message(MessageType::INFO, format!("[squiggles] {msg}"))
+                                .await;
+                        }
                     }
                     RunLogEvent::Completed { stats } => {
                         log_client

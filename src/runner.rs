@@ -80,10 +80,62 @@ pub enum RunLogEvent {
         line: String,
         parsed: Result<String, String>,
     },
-    /// A line from stderr was received.
-    Stderr { line: String },
+    /// A line from stderr was received with parsed build progress.
+    Stderr {
+        line: String,
+        progress: Option<BuildProgress>,
+    },
     /// The run completed.
     Completed { stats: RunStats },
+}
+
+/// Build progress parsed from cargo stderr output.
+#[derive(Debug, Clone)]
+pub enum BuildProgress {
+    /// Compiling a crate: "Compiling {crate} v{version}"
+    Compiling { krate: String },
+    /// Waiting for a lock: "Blocking waiting for file lock on {thing}"
+    WaitingForLock { target: String },
+    /// Build finished: "Finished ..."
+    Finished,
+    /// Running tests (from nextest): "Starting {n} tests..."
+    StartingTests { count: u32 },
+}
+
+/// Parse a stderr line to extract build progress information.
+fn parse_build_progress(line: &str) -> Option<BuildProgress> {
+    let trimmed = line.trim();
+
+    // "   Compiling foo v1.0.0 (/path/to/foo)"
+    if let Some(rest) = trimmed.strip_prefix("Compiling ") {
+        // Extract crate name (before the version)
+        let krate = rest.split_whitespace().next()?.to_string();
+        return Some(BuildProgress::Compiling { krate });
+    }
+
+    // "Blocking waiting for file lock on package cache"
+    if let Some(rest) = trimmed.strip_prefix("Blocking waiting for file lock on ") {
+        return Some(BuildProgress::WaitingForLock {
+            target: rest.to_string(),
+        });
+    }
+
+    // "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.23s"
+    if trimmed.starts_with("Finished ") {
+        return Some(BuildProgress::Finished);
+    }
+
+    // "    Starting 48 tests across 4 binaries"
+    if let Some(rest) = trimmed.strip_prefix("Starting ") {
+        // Parse "48 tests..."
+        if let Some(count_str) = rest.split_whitespace().next() {
+            if let Ok(count) = count_str.parse::<u32>() {
+                return Some(BuildProgress::StartingTests { count });
+            }
+        }
+    }
+
+    None
 }
 
 /// Run tests and collect failures.
@@ -311,8 +363,15 @@ pub async fn run_tests_verbose(
         while let Ok(Some(line)) = reader.next_line().await {
             stderr_lines += 1;
 
+            let progress = parse_build_progress(&line);
+
             if let Some(ref tx) = stderr_log_tx {
-                let _ = tx.send(RunLogEvent::Stderr { line: line.clone() }).await;
+                let _ = tx
+                    .send(RunLogEvent::Stderr {
+                        line: line.clone(),
+                        progress,
+                    })
+                    .await;
             }
 
             debug!(line = %line, "stderr");
