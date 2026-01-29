@@ -39,7 +39,7 @@ fn main() {
     let figue_config = args::builder::<Args>()
         .expect("failed to create figue builder")
         .cli(|c| c.strict())
-        .env(|e| e.strict())
+        .env(|e| e.prefix("SQUIGGLES"))
         .file(|f| {
             f.strict()
                 .format(StyxFormat)
