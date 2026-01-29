@@ -1,37 +1,39 @@
 use facet::Facet;
+use facet_styx::GenerateSchema;
 
-// Embed the schema for the config file (generated from Config in build.rs).
-// This allows tooling to discover the schema from the binary.
-styx_embed::embed_outdir_file!("config.schema.styx");
-
-/// Squiggles configuration.
-///
-/// Projects must opt-in by creating `.config/squiggles/config.styx`.
-/// Without a config file, squiggles does nothing.
-#[derive(Facet, Debug, Clone)]
-pub struct Config {
+// Mirror the Config struct from src/config.rs for schema generation.
+// Keep this in sync with the actual Config struct!
+#[derive(Facet)]
+struct Config {
     /// Whether squiggles is enabled. Defaults to false.
     #[facet(default)]
-    pub enabled: bool,
+    enabled: bool,
 
     /// Test filter patterns to include (glob syntax).
     /// If empty/absent, all tests are included.
     /// Examples: `("tests::unit::*" "my_crate::*")`
     #[facet(default)]
-    pub include: Option<Vec<String>>,
+    include: Option<Vec<String>>,
 
     /// Test filter patterns to exclude (glob syntax).
     /// Examples: `("tests::integration::*" "*::slow_*")`
     #[facet(default)]
-    pub exclude: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
 
     /// Debounce delay in milliseconds after file save before running tests.
     /// Prevents rapid re-runs during burst saves.
     #[facet(default = 500)]
-    pub debounce_ms: u32,
+    debounce_ms: u32,
 
     /// Maximum number of test failures to report as diagnostics.
     /// Prevents flooding the editor with too many squiggles.
     #[facet(default = 50)]
-    pub max_diagnostics: u32,
+    max_diagnostics: u32,
+}
+
+fn main() {
+    GenerateSchema::<Config>::new()
+        .crate_name("squiggles-config")
+        .version("1")
+        .write("config.schema.styx");
 }
