@@ -587,13 +587,15 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
-        // Find all #[test] functions and their names
-        let test_functions = find_test_functions(&content);
+        // Find all #[test] functions with detailed span info
+        let test_functions = find_test_functions_detailed(&content);
         let mut hints = Vec::new();
 
-        for (line, fn_name) in test_functions {
+        for info in test_functions {
             // Skip if outside requested range
-            if line < params.range.start.line || line > params.range.end.line {
+            if info.name_span.line < params.range.start.line
+                || info.name_span.line > params.range.end.line
+            {
                 continue;
             }
 
@@ -602,30 +604,126 @@ impl LanguageServer for Backend {
             // We match by suffix since we only have the function name
             let result = state.test_results.iter().find(|(name, _)| {
                 // Match the function name at the end after ::
-                name.ends_with(&format!("::{fn_name}"))
-                    || name.ends_with(&format!("${fn_name}"))
-                    || **name == fn_name
+                name.ends_with(&format!("::{}", info.name))
+                    || name.ends_with(&format!("${}", info.name))
+                    || **name == info.name
             });
 
             if let Some((_, test_result)) = result {
-                let (label, tooltip) = match test_result {
-                    TestResult::Passed => ("✓ pass".to_string(), "Test passed".to_string()),
-                    TestResult::Failed(stored) => (
-                        "✗ fail".to_string(),
-                        format!("Test failed: {}", stored.failure.message),
-                    ),
-                };
+                match test_result {
+                    TestResult::Passed => {
+                        // Simple pass hint after the function name
+                        hints.push(InlayHint {
+                            position: Position {
+                                line: info.name_span.line,
+                                character: info.name_span.col + info.name_span.len,
+                            },
+                            label: InlayHintLabel::String(" ✓ pass".to_string()),
+                            kind: None,
+                            text_edits: None,
+                            tooltip: Some(InlayHintTooltip::String("Test passed".to_string())),
+                            padding_left: Some(false),
+                            padding_right: Some(true),
+                            data: None,
+                        });
+                    }
+                    TestResult::Failed(stored) => {
+                        // Fail hint after the function name
+                        hints.push(InlayHint {
+                            position: Position {
+                                line: info.name_span.line,
+                                character: info.name_span.col + info.name_span.len,
+                            },
+                            label: InlayHintLabel::String(" ✗ fail".to_string()),
+                            kind: None,
+                            text_edits: None,
+                            tooltip: Some(InlayHintTooltip::String(format!(
+                                "Test failed: {}",
+                                stored.failure.message
+                            ))),
+                            padding_left: Some(false),
+                            padding_right: Some(true),
+                            data: None,
+                        });
 
-                hints.push(InlayHint {
-                    position: Position { line, character: 0 },
-                    label: InlayHintLabel::String(label),
-                    kind: None,
-                    text_edits: None,
-                    tooltip: Some(InlayHintTooltip::String(tooltip)),
-                    padding_left: Some(true),
-                    padding_right: Some(false),
-                    data: None,
-                });
+                        // Add hints at each backtrace frame in this file
+                        for frame in &stored.failure.user_frames {
+                            // Check if this frame is in the current file
+                            let frame_file = frame
+                                .location
+                                .file
+                                .strip_prefix("./")
+                                .unwrap_or(&frame.location.file);
+                            if file_path.ends_with(frame_file) {
+                                let frame_line = frame.location.line.saturating_sub(1); // Convert to 0-indexed
+
+                                // Skip if outside requested range
+                                if frame_line < params.range.start.line
+                                    || frame_line > params.range.end.line
+                                {
+                                    continue;
+                                }
+
+                                hints.push(InlayHint {
+                                    position: Position {
+                                        line: frame_line,
+                                        character: 0, // Start of line for backtrace frames
+                                    },
+                                    label: InlayHintLabel::String(format!(
+                                        "← #{} {}",
+                                        frame.index,
+                                        frame
+                                            .function
+                                            .split("::")
+                                            .last()
+                                            .unwrap_or(&frame.function)
+                                    )),
+                                    kind: None,
+                                    text_edits: None,
+                                    tooltip: Some(InlayHintTooltip::String(format!(
+                                        "Backtrace frame #{}: {}",
+                                        frame.index, frame.function
+                                    ))),
+                                    padding_left: Some(true),
+                                    padding_right: Some(true),
+                                    data: None,
+                                });
+                            }
+                        }
+
+                        // Also add hint at panic location if it's in this file
+                        if let Some(ref panic_loc) = stored.failure.panic_location {
+                            let panic_file =
+                                panic_loc.file.strip_prefix("./").unwrap_or(&panic_loc.file);
+                            if file_path.ends_with(panic_file) {
+                                let panic_line = panic_loc.line.saturating_sub(1);
+
+                                if panic_line >= params.range.start.line
+                                    && panic_line <= params.range.end.line
+                                    && panic_line != info.name_span.line
+                                // Don't duplicate if same line
+                                {
+                                    hints.push(InlayHint {
+                                        position: Position {
+                                            line: panic_line,
+                                            character: 0,
+                                        },
+                                        label: InlayHintLabel::String("← panic here".to_string()),
+                                        kind: None,
+                                        text_edits: None,
+                                        tooltip: Some(InlayHintTooltip::String(format!(
+                                            "Panicked: {}",
+                                            stored.failure.message
+                                        ))),
+                                        padding_left: Some(true),
+                                        padding_right: Some(true),
+                                        data: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
