@@ -156,7 +156,7 @@ impl TestEvent {
                     message,
                     panic_location,
                     user_frames,
-                    full_output: stdout.clone(),
+                    full_output: strip_ansi_codes(stdout),
                 })
             }
             _ => None,
