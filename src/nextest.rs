@@ -218,19 +218,41 @@ fn parse_panic_header(stdout: &str) -> (String, Option<SourceLocation>) {
             // Parse file:line format (no column)
             if let Some(location) = parse_location_no_column(location_str) {
                 // Try to extract message from "Message:" if present
-                let message = if let Some(msg_idx) = stdout.find("Message:") {
-                    let after_msg = &stdout[msg_idx + "Message:".len()..];
-                    let clean_msg = strip_ansi_codes(after_msg);
-                    clean_msg.lines().next().unwrap_or("").trim().to_string()
-                } else {
-                    String::new()
-                };
+                let message = extract_color_backtrace_message(stdout);
                 return (message, Some(location));
             }
         }
     }
 
     (String::new(), None)
+}
+
+/// Extract the message from color-backtrace format.
+///
+/// Handles two formats:
+/// 1. Single line: `Message:  {text}\n`
+/// 2. Multi-line: `Message:\n{multi-line content}\nLocation:`
+fn extract_color_backtrace_message(stdout: &str) -> String {
+    let Some(msg_idx) = stdout.find("Message:") else {
+        return String::new();
+    };
+
+    let after_msg = &stdout[msg_idx + "Message:".len()..];
+
+    // Find where the message ends (at "Location:" line)
+    let msg_end = after_msg.find("\nLocation:").unwrap_or(after_msg.len());
+
+    let raw_message = &after_msg[..msg_end];
+
+    // Strip ANSI codes and clean up
+    let clean = strip_ansi_codes(raw_message);
+    let trimmed = clean.trim();
+
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    trimmed.to_string()
 }
 
 /// Strip ANSI escape codes from a string.
@@ -266,20 +288,26 @@ fn parse_location(s: &str) -> Option<SourceLocation> {
     Some(SourceLocation { file, line, column })
 }
 
-/// Parse backtrace frames and filter to user code (paths starting with `./`).
+/// Parse backtrace frames from test output.
+///
+/// Supports two formats:
+/// 1. Standard Rust backtrace: `   2: fn_name\n             at ./src/lib.rs:10:5`
+/// 2. color-backtrace: `14: fn_name\n    at /absolute/path/src/lib.rs:35`
+///
+/// Filters to user code only (paths containing `/src/` but not in `.rustup` or `/rustc/`).
 fn parse_backtrace_frames(stdout: &str) -> Vec<BacktraceFrame> {
     let mut frames = Vec::new();
 
-    // Backtrace lines look like:
-    //    2: sample_crate::inner_panic
-    //              at ./src/lib.rs:10:5
+    // Strip ANSI codes first - color-backtrace output is heavily colorized
+    let clean_stdout = strip_ansi_codes(stdout);
+
     let mut current_index: Option<u32> = None;
     let mut current_function: Option<String> = None;
 
-    for line in stdout.lines() {
+    for line in clean_stdout.lines() {
         let trimmed = line.trim();
 
-        // Check for frame header: "   2: function_name"
+        // Check for frame header: "2: function_name" or "14: function_name"
         if trimmed
             .chars()
             .next()
@@ -294,12 +322,23 @@ fn parse_backtrace_frames(stdout: &str) -> Vec<BacktraceFrame> {
                 }
             }
         }
-        // Check for location line: "             at ./src/lib.rs:10:5"
+        // Check for location line: "at ./src/lib.rs:10:5" or "at /abs/path:35"
         else if let Some(location_str) = trimmed.strip_prefix("at ") {
-            // Only include user code (paths starting with ./)
-            if location_str.starts_with("./") {
+            // Filter to user code:
+            // - Include paths starting with "./"
+            // - Include absolute paths containing "/src/" but not standard library
+            let is_user_code = location_str.starts_with("./")
+                || (location_str.contains("/src/")
+                    && !location_str.contains(".rustup")
+                    && !location_str.contains("/rustc/"));
+
+            if is_user_code {
                 if let (Some(idx), Some(func)) = (current_index.take(), current_function.take()) {
-                    if let Some(location) = parse_location(location_str) {
+                    // Try parsing with column first, then without
+                    let location = parse_location(location_str)
+                        .or_else(|| parse_location_no_column(location_str));
+
+                    if let Some(location) = location {
                         frames.push(BacktraceFrame {
                             index: idx,
                             function: func,
@@ -449,6 +488,280 @@ mod tests {
                 failure.panic_location.is_some(),
                 "Missing panic location for {}",
                 failure.name
+            );
+        }
+    }
+
+    // Color-backtrace corpus tests
+    mod color_backtrace_corpus {
+        use super::*;
+
+        const CORPUS: &str =
+            include_str!("../test-fixtures/parse-corpus/color-backtrace-failures.jsonl");
+
+        fn get_failure(test_name: &str) -> TestFailure {
+            CORPUS
+                .lines()
+                .filter_map(|line| parse_message(line).ok())
+                .filter_map(|msg| match msg {
+                    NextestMessage::Test(test_event) => test_event.parse_failure(),
+                    _ => None,
+                })
+                .find(|f| f.name.contains(test_name))
+                .unwrap_or_else(|| panic!("Test {} not found in corpus", test_name))
+        }
+
+        #[test]
+        fn parse_all_color_backtrace_messages() {
+            let failures: Vec<TestFailure> = parse_messages(CORPUS)
+                .into_iter()
+                .filter_map(|r| r.ok())
+                .filter_map(|msg| match msg {
+                    NextestMessage::Test(test_event) => test_event.parse_failure(),
+                    _ => None,
+                })
+                .collect();
+
+            // Should have 14 failures
+            assert_eq!(failures.len(), 14, "Expected 14 failures in corpus");
+
+            // All should have panic locations
+            for failure in &failures {
+                assert!(
+                    failure.panic_location.is_some(),
+                    "Missing panic location for {}",
+                    failure.name
+                );
+            }
+
+            // All should have non-empty messages
+            for failure in &failures {
+                assert!(
+                    !failure.message.is_empty(),
+                    "Empty message for {}",
+                    failure.name
+                );
+            }
+        }
+
+        #[test]
+        fn simple_panic_message() {
+            let f = get_failure("test_simple_panic");
+            assert_eq!(f.message, "simple panic message");
+            assert_eq!(f.panic_location.as_ref().unwrap().file, "src/lib.rs");
+            assert_eq!(f.panic_location.as_ref().unwrap().line, 35);
+        }
+
+        #[test]
+        fn assertion_eq_with_message() {
+            let f = get_failure("test_assertion_failure");
+            assert!(
+                f.message.contains("assertion `left == right` failed"),
+                "message was: {}",
+                f.message
+            );
+            assert!(f.message.contains("values should match"));
+        }
+
+        #[test]
+        fn assertion_ne_with_message() {
+            let f = get_failure("test_assert_ne");
+            assert!(
+                f.message.contains("assertion `left != right` failed"),
+                "message was: {}",
+                f.message
+            );
+            assert!(f.message.contains("vectors should be different"));
+        }
+
+        #[test]
+        fn assert_no_message() {
+            let f = get_failure("test_assert_no_message");
+            assert!(
+                f.message.contains("assertion failed"),
+                "message was: {}",
+                f.message
+            );
+        }
+
+        #[test]
+        fn assert_with_format() {
+            let f = get_failure("test_assert_with_format");
+            assert!(
+                f.message.contains("should be greater than 10"),
+                "message was: {}",
+                f.message
+            );
+        }
+
+        #[test]
+        fn unwrap_none() {
+            let f = get_failure("test_unwrap_none");
+            assert!(
+                f.message.contains("Option::unwrap()") && f.message.contains("None"),
+                "message was: {}",
+                f.message
+            );
+        }
+
+        #[test]
+        fn unwrap_err() {
+            let f = get_failure("test_unwrap_err");
+            assert!(
+                f.message.contains("Result::unwrap()") && f.message.contains("Err"),
+                "message was: {}",
+                f.message
+            );
+            assert!(f.message.contains("something went wrong"));
+        }
+
+        #[test]
+        fn expect_none() {
+            let f = get_failure("test_expect_none");
+            assert!(
+                f.message.contains("expected a value but got None"),
+                "message was: {}",
+                f.message
+            );
+        }
+
+        #[test]
+        fn index_out_of_bounds() {
+            let f = get_failure("test_index_out_of_bounds");
+            assert!(
+                f.message.contains("index out of bounds"),
+                "message was: {}",
+                f.message
+            );
+            assert!(f.message.contains("len is 3") && f.message.contains("index is 10"));
+        }
+
+        #[test]
+        fn unreachable() {
+            let f = get_failure("test_unreachable");
+            assert!(
+                f.message.contains("unreachable code"),
+                "message was: {}",
+                f.message
+            );
+        }
+
+        #[test]
+        fn todo() {
+            let f = get_failure("test_todo");
+            assert!(
+                f.message.contains("not yet implemented"),
+                "message was: {}",
+                f.message
+            );
+            assert!(f.message.contains("implement this later"));
+        }
+
+        #[test]
+        fn unimplemented() {
+            let f = get_failure("test_unimplemented");
+            assert!(
+                f.message.contains("not implemented"),
+                "message was: {}",
+                f.message
+            );
+            assert!(f.message.contains("not yet done"));
+        }
+
+        #[test]
+        fn backtrace_frames_are_parsed() {
+            let f = get_failure("test_with_color_backtrace");
+            // Should have user frames from the test crate
+            assert!(
+                !f.user_frames.is_empty(),
+                "No user frames parsed for {}",
+                f.name
+            );
+
+            // Should include frames from our test file
+            let has_test_frame = f.user_frames.iter().any(|frame| {
+                frame.location.file.contains("color-backtrace-crate")
+                    || frame.location.file.contains("src/lib.rs")
+            });
+            assert!(
+                has_test_frame,
+                "No frame from test file. Frames: {:?}",
+                f.user_frames
+            );
+        }
+    }
+
+    // Tests for multi-line message format (rediff/ariadne output)
+    mod multiline_message_corpus {
+        use super::*;
+
+        const CORPUS: &str =
+            include_str!("../test-fixtures/parse-corpus/styx-multiline-failures.jsonl");
+
+        fn get_failure(test_name: &str) -> TestFailure {
+            CORPUS
+                .lines()
+                .filter_map(|line| parse_message(line).ok())
+                .filter_map(|msg| match msg {
+                    NextestMessage::Test(test_event) => test_event.parse_failure(),
+                    _ => None,
+                })
+                .find(|f| f.name.contains(test_name))
+                .unwrap_or_else(|| panic!("Test {} not found in corpus", test_name))
+        }
+
+        #[test]
+        fn multiline_message_extracted() {
+            let f = get_failure("test_reopen_closed_path_error");
+
+            // The message should contain the error diff, not be empty
+            assert!(
+                !f.message.is_empty(),
+                "Message should not be empty for multiline format"
+            );
+
+            // Should contain the actual error content
+            assert!(
+                f.message.contains("EXPECTED ERRORS") || f.message.contains("Error:"),
+                "Message should contain error content, got: {}",
+                f.message
+            );
+        }
+
+        #[test]
+        fn multiline_location_parsed() {
+            let f = get_failure("test_reopen_closed_path_error");
+
+            let loc = f
+                .panic_location
+                .as_ref()
+                .expect("Should have panic location");
+            assert!(
+                loc.file.contains("styx-testhelpers") || loc.file.contains("lib.rs"),
+                "Location file should be styx-testhelpers, got: {}",
+                loc.file
+            );
+            assert_eq!(loc.line, 140);
+        }
+
+        #[test]
+        fn multiline_backtrace_frames() {
+            let f = get_failure("test_reopen_closed_path_error");
+
+            assert!(
+                !f.user_frames.is_empty(),
+                "Should have backtrace frames, got none"
+            );
+
+            // Should include styx frames
+            let has_styx_frame = f
+                .user_frames
+                .iter()
+                .any(|frame| frame.location.file.contains("styx"));
+            assert!(
+                has_styx_frame,
+                "Should have styx frames. Frames: {:?}",
+                f.user_frames
             );
         }
     }

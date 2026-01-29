@@ -1276,26 +1276,18 @@ fn format_failure_hover(failure: &TestFailure) -> String {
 
     // Add location if available
     if let Some(ref loc) = failure.panic_location {
-        result.push_str(&format!(
-            "at [`{}:{}`]({}:{})\n\n",
-            loc.file, loc.line, loc.file, loc.line
-        ));
+        result.push_str(&format!("at `{}:{}`\n\n", loc.file, loc.line));
     }
 
     // Add relevant backtrace frames (user code only)
     if !failure.user_frames.is_empty() {
         result.push_str("**Backtrace:**\n");
         for frame in &failure.user_frames {
-            // Format: `#N function` at file:line
+            // Format: #N function at file:line
             let short_fn = frame.function.split("::").last().unwrap_or(&frame.function);
             result.push_str(&format!(
-                "- `#{}` `{}` at [`{}:{}`]({}:{})\n",
-                frame.index,
-                short_fn,
-                frame.location.file,
-                frame.location.line,
-                frame.location.file,
-                frame.location.line
+                "- #{} `{}` at `{}:{}`\n",
+                frame.index, short_fn, frame.location.file, frame.location.line
             ));
         }
     }
@@ -1756,7 +1748,7 @@ fn test_with_parens() {}
 
             let hover = format_failure_hover(&failure);
             assert!(hover.contains("**Backtrace:**"));
-            assert!(hover.contains("`#14`"));
+            assert!(hover.contains("#14"));
             assert!(hover.contains("`inner_fn`"));
             assert!(hover.contains("./src/helper.rs:20"));
         }
