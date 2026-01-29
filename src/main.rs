@@ -3,6 +3,8 @@ use facet_styx::StyxFormat;
 use figue as args;
 
 mod config;
+mod lsp;
+mod nextest;
 
 use config::Config;
 
@@ -46,7 +48,10 @@ fn main() {
         return;
     }
 
-    println!("Config loaded: {:#?}", args.config);
-
-    // TODO: Start LSP server
+    // Start the LSP server
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to create tokio runtime")
+        .block_on(lsp::run(args.config));
 }

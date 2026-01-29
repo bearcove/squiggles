@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 # Facet ecosystem
 facet = { git = "https://github.com/facet-rs/facet", branch = "main", features = ["alloc"] }
+facet-json = { git = "https://github.com/facet-rs/facet", branch = "main" }
 
 # Config parsing
 figue = { git = "https://github.com/bearcove/figue", branch = "main" }
