@@ -1,0 +1,5 @@
+[workspace]
+changelog_update = true
+semver_check = true
+dependencies_update = true
+git_release_enable = true

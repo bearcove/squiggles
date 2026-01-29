@@ -1,6 +1,21 @@
 [package]
-name = "sentinel"
+name = "squiggles"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Facet ecosystem
+facet = { git = "https://github.com/facet-rs/facet", branch = "main", features = ["alloc"] }
+
+# Config parsing
+figue = { git = "https://github.com/bearcove/figue", branch = "main" }
+facet-styx = { git = "https://github.com/bearcove/styx", branch = "main", features = ["figue"] }
+
+# Async runtime (tower-lsp is built on tokio)
+tokio = { version = "1", features = ["full"] }
+
+# LSP framework
+tower-lsp = "0.20"
+
+# File watching
+notify = "8"

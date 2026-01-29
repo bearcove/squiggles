@@ -1,0 +1,17 @@
+// Squiggles configuration
+// Projects must opt-in by having this file
+
+enabled true
+
+// Only run these tests (glob patterns)
+// If absent, all tests are included
+// include ("tests::unit::*" "my_crate::*")
+
+// Never run these tests
+// exclude ("tests::integration::*" "*::slow_*")
+
+// Debounce saves (ms) - wait this long after last save before running tests
+debounce_ms 500
+
+// Maximum diagnostics to show (prevents flooding)
+max_diagnostics 50
