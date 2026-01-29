@@ -3,7 +3,7 @@
 //! Handles creating progress tokens and sending progress notifications
 //! for test runs and idle status.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tower_lsp::Client;
 use tower_lsp::lsp_types::notification::Progress;
@@ -29,7 +29,7 @@ fn new_token() -> ProgressToken {
 pub struct ProgressHandle {
     client: Client,
     token: ProgressToken,
-    ended: bool,
+    ended: AtomicBool,
 }
 
 impl ProgressHandle {
@@ -70,7 +70,7 @@ impl ProgressHandle {
         Self {
             client,
             token,
-            ended: false,
+            ended: AtomicBool::new(false),
         }
     }
 
@@ -107,9 +107,14 @@ impl ProgressHandle {
     }
 
     /// End the progress indicator with a final message.
-    pub async fn end(mut self, message: Option<String>) {
+    ///
+    /// This can be called on `&self` so it works with `Arc<ProgressHandle>`.
+    pub async fn end(&self, message: Option<String>) {
+        // Only send end once
+        if self.ended.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.send_end(message).await;
-        self.ended = true;
     }
 
     async fn send_end(&self, message: Option<String>) {
@@ -126,7 +131,7 @@ impl ProgressHandle {
 
 impl Drop for ProgressHandle {
     fn drop(&mut self) {
-        if !self.ended {
+        if !self.ended.load(Ordering::SeqCst) {
             // We can't await in drop, so spawn a task
             let client = self.client.clone();
             let token = self.token.clone();

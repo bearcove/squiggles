@@ -827,14 +827,19 @@ async fn test_runner_loop(
 
         // Start progress indicator
         let progress =
-            ProgressHandle::begin(client.clone(), "Squiggles", Some("Running tests...".into()))
-                .await;
+            ProgressHandle::begin(client.clone(), "Squiggles", Some("Starting...".into())).await;
+        let progress = Arc::new(progress);
 
         // Set up verbose logging channel
         let (log_tx, mut log_rx) = mpsc::channel::<RunLogEvent>(4096);
         let log_client = client.clone();
+        let log_progress = Arc::clone(&progress);
 
-        // Spawn a task to forward log events to the LSP client
+        // Track test progress
+        let mut tests_completed = 0u32;
+        let mut tests_total = 0u32;
+
+        // Spawn a task to forward log events to the LSP client and update progress
         let log_task = tokio::spawn(async move {
             while let Some(event) = log_rx.recv().await {
                 match event {
@@ -848,7 +853,38 @@ async fn test_runner_loop(
                     }
                     RunLogEvent::Stdout { line, parsed } => {
                         let status = match &parsed {
-                            Ok(desc) => format!("OK: {desc}"),
+                            Ok(desc) => {
+                                // Parse test results to update progress
+                                if desc.starts_with("suite:started") {
+                                    // Extract test_count from "suite:started test_count=N"
+                                    if let Some(count_str) = desc
+                                        .split("test_count=")
+                                        .nth(1)
+                                        .and_then(|s| s.split_whitespace().next())
+                                    {
+                                        if let Ok(count) = count_str.parse::<u32>() {
+                                            tests_total += count;
+                                            log_progress
+                                                .report(format!("Running tests (0/{tests_total})"))
+                                                .await;
+                                        }
+                                    }
+                                } else if desc.starts_with("test:ok")
+                                    || desc.starts_with("test:failed")
+                                {
+                                    tests_completed += 1;
+                                    if tests_total > 0 {
+                                        let pct = (tests_completed * 100 / tests_total).min(100);
+                                        log_progress
+                                            .report_percent(
+                                                format!("Running tests ({tests_completed}/{tests_total})"),
+                                                pct,
+                                            )
+                                            .await;
+                                    }
+                                }
+                                format!("OK: {desc}")
+                            }
                             Err(e) => format!("PARSE_ERROR: {e}\n  line: {line}"),
                         };
                         log_client
@@ -861,7 +897,7 @@ async fn test_runner_loop(
                             .log_message(MessageType::LOG, format!("[squiggles] stderr: {line}"))
                             .await;
 
-                        // If we parsed build progress, log it more prominently
+                        // Update work done progress based on build status
                         if let Some(prog) = progress {
                             use crate::runner::BuildProgress;
                             let msg = match prog {
@@ -871,14 +907,15 @@ async fn test_runner_loop(
                                 BuildProgress::WaitingForLock { target } => {
                                     format!("Waiting for lock on {target}...")
                                 }
-                                BuildProgress::Finished => "Build finished".to_string(),
+                                BuildProgress::Finished => {
+                                    "Build finished, running tests...".to_string()
+                                }
                                 BuildProgress::StartingTests { count } => {
-                                    format!("Running {count} tests...")
+                                    tests_total = count;
+                                    format!("Running tests (0/{count})")
                                 }
                             };
-                            log_client
-                                .log_message(MessageType::INFO, format!("[squiggles] {msg}"))
-                                .await;
+                            log_progress.report(msg).await;
                         }
                     }
                     RunLogEvent::Completed { stats } => {
