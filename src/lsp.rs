@@ -534,8 +534,46 @@ impl LanguageServer for Backend {
         let _ = self.test_trigger.send(()).await;
     }
 
-    async fn did_open(&self, _params: DidOpenTextDocumentParams) {
-        // We track open files but don't need their content
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri;
+
+        // Re-publish diagnostics for this file if we have any
+        let state = self.state.read().await;
+        if let Some(failures) = state.failures.get(&uri.to_string()) {
+            let diagnostics: Vec<Diagnostic> = failures
+                .iter()
+                .map(|stored| {
+                    let message = if !stored.failure.message.is_empty() {
+                        stored
+                            .failure
+                            .message
+                            .lines()
+                            .next()
+                            .unwrap_or("Test failed")
+                            .to_string()
+                    } else {
+                        "Test failed".to_string()
+                    };
+
+                    Diagnostic {
+                        range: stored.range,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        code: None,
+                        code_description: None,
+                        source: Some("squiggles".to_string()),
+                        message,
+                        related_information: None,
+                        tags: None,
+                        data: None,
+                    }
+                })
+                .collect();
+
+            drop(state); // Release lock before async call
+            self.client
+                .publish_diagnostics(uri, diagnostics, None)
+                .await;
+        }
     }
 
     async fn did_close(&self, _params: DidCloseTextDocumentParams) {
