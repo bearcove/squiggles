@@ -1,12 +1,24 @@
 //! Convert test failures to LSP diagnostics.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use tower_lsp::lsp_types::*;
 
 use crate::lsp::{Span, find_test_functions_detailed};
 use crate::nextest::{SourceLocation, TestFailure};
+
+/// Write debug info to /tmp/squiggles-debug.log
+fn debug_log(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/squiggles-debug.log")
+    {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
 
 /// A collection of diagnostics grouped by file URI.
 pub type DiagnosticsByFile = HashMap<Url, Vec<Diagnostic>>;
@@ -46,6 +58,12 @@ impl TestFunctionIndex {
         };
 
         // Walk the workspace looking for .rs files
+        debug_log(&format!(
+            "TestFunctionIndex: scanning {} with {} exclude patterns: {:?}",
+            workspace_root.display(),
+            exclude_patterns.len(),
+            exclude_patterns
+        ));
         if let Ok(entries) = walkdir(&workspace_root, exclude_patterns) {
             for entry in entries {
                 if entry.extension().is_some_and(|e| e == "rs")
@@ -54,6 +72,12 @@ impl TestFunctionIndex {
                 {
                     let tests = find_test_functions_detailed(&content);
                     for info in tests {
+                        debug_log(&format!(
+                            "TestFunctionIndex: found test '{}' at {}:{}",
+                            info.name,
+                            entry.display(),
+                            info.name_span.line
+                        ));
                         by_name.insert(
                             info.name.clone(),
                             TestLocation {
@@ -79,12 +103,13 @@ impl TestFunctionIndex {
 /// Walk a directory recursively, yielding file paths.
 fn walkdir(root: &Path, exclude_patterns: &[String]) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
-    walkdir_inner(root, &mut files, exclude_patterns)?;
+    walkdir_inner(root, root, &mut files, exclude_patterns)?;
     Ok(files)
 }
 
 fn walkdir_inner(
     dir: &Path,
+    root: &Path,
     files: &mut Vec<std::path::PathBuf>,
     exclude_patterns: &[String],
 ) -> std::io::Result<()> {
@@ -94,8 +119,18 @@ fn walkdir_inner(
             if name == "target" || name.starts_with('.') {
                 return Ok(());
             }
-            // Skip directories matching exclude patterns
-            if exclude_patterns.iter().any(|p| name == p) {
+        }
+
+        // Check exclude patterns against the relative path from root
+        if let Ok(rel_path) = dir.strip_prefix(root) {
+            let rel_str = rel_path.to_string_lossy();
+            if exclude_patterns.iter().any(|p| {
+                // Match if the relative path equals the pattern or starts with pattern/
+                rel_str == *p || rel_str.starts_with(&format!("{p}/"))
+            }) {
+                debug_log(&format!(
+                    "scan_exclude: skipping {rel_str} (matched exclude pattern)"
+                ));
                 return Ok(());
             }
         }
@@ -104,7 +139,7 @@ fn walkdir_inner(
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                walkdir_inner(&path, files, exclude_patterns)?;
+                walkdir_inner(&path, root, files, exclude_patterns)?;
             } else {
                 files.push(path);
             }
