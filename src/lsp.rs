@@ -1,6 +1,6 @@
 //! LSP server implementation using tower-lsp.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,20 +31,39 @@ pub struct ServerState {
     /// Test failures indexed by file URI for hover lookup.
     /// Maps URI string -> list of failures in that file.
     pub failures: HashMap<String, Vec<StoredFailure>>,
+    /// URIs that currently have published diagnostics.
+    /// Used to clear stale diagnostics when tests pass.
+    pub files_with_diagnostics: HashSet<String>,
 }
 
 impl ServerState {
     /// Store failures for hover lookup.
-    pub fn store_failures(&mut self, failures: Vec<(Url, StoredFailure)>) {
+    /// Returns URIs that previously had diagnostics but no longer do (need clearing).
+    pub fn store_failures(&mut self, failures: Vec<(Url, StoredFailure)>) -> Vec<Url> {
+        // Track which files have failures now
+        let mut new_files: HashSet<String> = HashSet::new();
+
         // Clear old failures
         self.failures.clear();
+
         // Index by file
         for (uri, failure) in failures {
-            self.failures
-                .entry(uri.to_string())
-                .or_default()
-                .push(failure);
+            let uri_str = uri.to_string();
+            new_files.insert(uri_str.clone());
+            self.failures.entry(uri_str).or_default().push(failure);
         }
+
+        // Find files that had diagnostics before but don't now
+        let stale: Vec<Url> = self
+            .files_with_diagnostics
+            .difference(&new_files)
+            .filter_map(|s| Url::parse(s).ok())
+            .collect();
+
+        // Update tracking
+        self.files_with_diagnostics = new_files;
+
+        stale
     }
 
     /// Find a failure at the given position for hover.
@@ -89,6 +108,7 @@ impl Backend {
                 config,
                 workspace_root: None,
                 failures: HashMap::new(),
+                files_with_diagnostics: HashSet::new(),
             })),
             test_trigger,
         }
@@ -362,8 +382,8 @@ async fn test_runner_loop(
                 let diagnostics_by_file =
                     failures_to_diagnostics(&result.failures, &workspace_root);
 
-                // Store failures for hover lookup
-                {
+                // Store failures for hover lookup and get stale files
+                let stale_uris = {
                     let mut state_guard = state.write().await;
                     let stored: Vec<_> = result
                         .failures
@@ -381,10 +401,15 @@ async fn test_runner_loop(
                             ))
                         })
                         .collect();
-                    state_guard.store_failures(stored);
+                    state_guard.store_failures(stored)
+                };
+
+                // Clear diagnostics from files that no longer have failures
+                for uri in stale_uris {
+                    client.publish_diagnostics(uri, vec![], None).await;
                 }
 
-                // Publish diagnostics for each file
+                // Publish diagnostics for each file with failures
                 for (uri, diags) in diagnostics_by_file {
                     client.publish_diagnostics(uri, diags, None).await;
                 }
