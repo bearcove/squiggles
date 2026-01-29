@@ -167,6 +167,12 @@ pub async fn run_tests_verbose(
         "--no-fail-fast".to_string(),
     ];
 
+    // Use captain's shared target directory if configured
+    if let Some(target_dir) = config.target_dir() {
+        args.push("--target-dir".to_string());
+        args.push(target_dir.display().to_string());
+    }
+
     // Add filter expressions if configured
     if let Some(ref include) = config.include {
         if !include.is_empty() {

@@ -47,6 +47,7 @@ edition = "2021"
         exclude: None,
         debounce_ms: 0,
         max_diagnostics: 50,
+        captain: false,
     };
 
     let outcome = run_tests(crate_path, &config).await;
@@ -105,6 +106,7 @@ fn test_math() {
         exclude: None,
         debounce_ms: 0,
         max_diagnostics: 50,
+        captain: false,
     };
 
     let outcome = run_tests(crate_path, &config).await;
@@ -142,6 +144,7 @@ async fn test_runner_with_failures() {
         exclude: None,
         debounce_ms: 0,
         max_diagnostics: 50,
+        captain: false,
     };
 
     let outcome = run_tests(&fixture, &config).await;
@@ -284,6 +287,7 @@ edition = "2021"
         exclude: None,
         debounce_ms: 0,
         max_diagnostics: 50,
+        captain: false,
     };
 
     // This should complete quickly, not hang

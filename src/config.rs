@@ -34,4 +34,21 @@ pub struct Config {
     /// Prevents flooding the editor with too many squiggles.
     #[facet(default = 50)]
     pub max_diagnostics: u32,
+
+    /// Use captain's shared target directory (~/.captain/target).
+    /// This avoids lock contention with rust-analyzer and shares
+    /// build artifacts across projects.
+    #[facet(default)]
+    pub captain: bool,
+}
+
+impl Config {
+    /// Get the target directory to use, if captain mode is enabled.
+    pub fn target_dir(&self) -> Option<std::path::PathBuf> {
+        if self.captain {
+            dirs::home_dir().map(|home| home.join(".captain/target"))
+        } else {
+            None
+        }
+    }
 }
