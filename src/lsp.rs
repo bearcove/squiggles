@@ -548,11 +548,7 @@ impl LanguageServer for Backend {
 
         let state = self.state.read().await;
         if let Some(stored) = state.find_failure_at(&uri, position) {
-            // Format the hover content with test name and full output
-            let content = format!(
-                "## Test Failure: `{}`\n\n```\n{}\n```",
-                stored.failure.name, stored.failure.full_output
-            );
+            let content = format_failure_hover(&stored.failure);
 
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -1257,6 +1253,85 @@ async fn test_runner_loop(
     }
 }
 
+/// Format a test failure for hover display.
+///
+/// Extracts the relevant information from color-backtrace or standard backtrace output
+/// and formats it as markdown for the hover popup.
+fn format_failure_hover(failure: &TestFailure) -> String {
+    let output = &failure.full_output;
+    let mut result = String::new();
+
+    // Extract the message
+    let message = if !failure.message.is_empty() {
+        failure.message.clone()
+    } else if let Some(msg) = extract_color_backtrace_message(output) {
+        msg
+    } else {
+        "Test failed".to_string()
+    };
+
+    result.push_str("**");
+    result.push_str(&message);
+    result.push_str("**\n\n");
+
+    // Add location if available
+    if let Some(ref loc) = failure.panic_location {
+        result.push_str(&format!(
+            "at [`{}:{}`]({}:{})\n\n",
+            loc.file, loc.line, loc.file, loc.line
+        ));
+    }
+
+    // Add relevant backtrace frames (user code only)
+    if !failure.user_frames.is_empty() {
+        result.push_str("**Backtrace:**\n");
+        for frame in &failure.user_frames {
+            // Format: `#N function` at file:line
+            let short_fn = frame.function.split("::").last().unwrap_or(&frame.function);
+            result.push_str(&format!(
+                "- `#{}` `{}` at [`{}:{}`]({}:{})\n",
+                frame.index,
+                short_fn,
+                frame.location.file,
+                frame.location.line,
+                frame.location.file,
+                frame.location.line
+            ));
+        }
+    }
+
+    result
+}
+
+/// Extract the message from color-backtrace format output.
+///
+/// Color-backtrace outputs:
+/// ```
+/// The application panicked (crashed).
+/// Message:  {message}
+///   {optional extra lines for assertion failures}
+/// Location: {file}:{line}
+/// ```
+fn extract_color_backtrace_message(output: &str) -> Option<String> {
+    // Look for "Message:" prefix
+    let msg_start = output.find("Message:")?;
+    let after_msg = &output[msg_start + "Message:".len()..];
+
+    // Find where the message ends (at "Location:" or blank line)
+    let msg_end = after_msg
+        .find("\nLocation:")
+        .or_else(|| after_msg.find("\n\n"))
+        .unwrap_or(after_msg.len());
+
+    let message = after_msg[..msg_end].trim();
+
+    if message.is_empty() {
+        None
+    } else {
+        Some(message.to_string())
+    }
+}
+
 /// Resolve a file path relative to the workspace root.
 fn resolve_path(file: &str, workspace_root: &std::path::Path) -> std::path::PathBuf {
     let file_path = std::path::Path::new(file);
@@ -1601,5 +1676,103 @@ fn test_with_parens() {}
         let code = "   \n\n   \t\t\n";
         let results = find_test_functions(code);
         assert!(results.is_empty());
+    }
+
+    mod hover_format {
+        use super::super::{extract_color_backtrace_message, format_failure_hover};
+        use crate::nextest::{BacktraceFrame, SourceLocation, TestFailure};
+
+        #[test]
+        fn extract_simple_message() {
+            let output = "The application panicked (crashed).\nMessage:  simple panic message\nLocation: src/lib.rs:35\n";
+            let msg = extract_color_backtrace_message(output);
+            assert_eq!(msg, Some("simple panic message".to_string()));
+        }
+
+        #[test]
+        fn extract_multiline_assertion_message() {
+            let output = "The application panicked (crashed).\nMessage:  assertion `left == right` failed: values should match\n  left: 42\n right: 41\nLocation: src/lib.rs:30\n";
+            let msg = extract_color_backtrace_message(output);
+            assert_eq!(
+                msg,
+                Some(
+                    "assertion `left == right` failed: values should match\n  left: 42\n right: 41"
+                        .to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn format_failure_with_message_and_location() {
+            let failure = TestFailure {
+                name: "test::my_test".to_string(),
+                message: "assertion failed".to_string(),
+                panic_location: Some(SourceLocation {
+                    file: "src/lib.rs".to_string(),
+                    line: 42,
+                    column: 5,
+                }),
+                user_frames: vec![],
+                full_output: String::new(),
+            };
+
+            let hover = format_failure_hover(&failure);
+            assert!(hover.contains("**assertion failed**"));
+            assert!(hover.contains("src/lib.rs:42"));
+        }
+
+        #[test]
+        fn format_failure_with_backtrace() {
+            let failure = TestFailure {
+                name: "test::my_test".to_string(),
+                message: "panicked".to_string(),
+                panic_location: Some(SourceLocation {
+                    file: "src/lib.rs".to_string(),
+                    line: 10,
+                    column: 5,
+                }),
+                user_frames: vec![
+                    BacktraceFrame {
+                        index: 14,
+                        function: "my_crate::helper::inner_fn".to_string(),
+                        location: SourceLocation {
+                            file: "./src/helper.rs".to_string(),
+                            line: 20,
+                            column: 9,
+                        },
+                    },
+                    BacktraceFrame {
+                        index: 15,
+                        function: "my_crate::tests::my_test".to_string(),
+                        location: SourceLocation {
+                            file: "./src/lib.rs".to_string(),
+                            line: 10,
+                            column: 5,
+                        },
+                    },
+                ],
+                full_output: String::new(),
+            };
+
+            let hover = format_failure_hover(&failure);
+            assert!(hover.contains("**Backtrace:**"));
+            assert!(hover.contains("`#14`"));
+            assert!(hover.contains("`inner_fn`"));
+            assert!(hover.contains("./src/helper.rs:20"));
+        }
+
+        #[test]
+        fn format_failure_extracts_color_backtrace_message() {
+            let failure = TestFailure {
+                name: "test::my_test".to_string(),
+                message: String::new(), // Empty, should fall back to extraction
+                panic_location: None,
+                user_frames: vec![],
+                full_output: "The application panicked (crashed).\nMessage:  custom error from color-backtrace\nLocation: src/lib.rs:5\n".to_string(),
+            };
+
+            let hover = format_failure_hover(&failure);
+            assert!(hover.contains("**custom error from color-backtrace**"));
+        }
     }
 }

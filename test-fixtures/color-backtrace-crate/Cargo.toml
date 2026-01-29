@@ -1,0 +1,10 @@
+[package]
+name = "color-backtrace-crate"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dev-dependencies]
+color-backtrace = "0.6"
+ctor = "0.2"
