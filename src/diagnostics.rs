@@ -15,7 +15,9 @@ pub type DiagnosticsByFile = HashMap<Url, Vec<Diagnostic>>;
 #[derive(Debug, Clone)]
 pub struct TestLocation {
     pub uri: Url,
-    /// Span of the function name (what we want to highlight)
+    /// Span of the #[test] attribute (where we put the error diagnostic)
+    pub attr_span: Span,
+    /// Span of the function name
     pub name_span: Span,
 }
 
@@ -43,6 +45,7 @@ impl TestFunctionIndex {
                                     info.name.clone(),
                                     TestLocation {
                                         uri: uri.clone(),
+                                        attr_span: info.attr_span,
                                         name_span: info.name_span,
                                     },
                                 );
@@ -94,7 +97,7 @@ fn walkdir_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Re
 /// Convert test failures to LSP diagnostics, grouped by file.
 ///
 /// Diagnostics are placed at the test function definition, not the panic location.
-/// The panic location is included as related information.
+/// Panic locations and backtrace frames are deduplicated with counts.
 pub fn failures_to_diagnostics(
     failures: &[TestFailure],
     workspace_root: &Path,
@@ -102,13 +105,18 @@ pub fn failures_to_diagnostics(
 ) -> DiagnosticsByFile {
     let mut diagnostics: DiagnosticsByFile = HashMap::new();
 
+    // Track panic locations: (uri, line) -> list of test names
+    let mut panic_locations: HashMap<(String, u32), Vec<String>> = HashMap::new();
+    // Track backtrace frames: (uri, line) -> list of test names
+    let mut frame_locations: HashMap<(String, u32), Vec<String>> = HashMap::new();
+
     for failure in failures {
         let short_name = extract_test_name(&failure.name);
 
         // Try to find the test function location
         let (uri, range) = if let Some(loc) = test_index.get(&short_name) {
-            // Found the test function - highlight the function name
-            (loc.uri.clone(), loc.name_span.to_range())
+            // Found the test function - highlight the #[test] attribute
+            (loc.uri.clone(), loc.attr_span.to_range())
         } else if let Some(ref panic_loc) = failure.panic_location {
             // Fall back to panic location if we can't find the test
             let file_path = resolve_path(&panic_loc.file, workspace_root);
@@ -122,62 +130,149 @@ pub fn failures_to_diagnostics(
             continue;
         };
 
-        // Build related information: panic location + backtrace frames
-        let mut related_info: Vec<DiagnosticRelatedInformation> = Vec::new();
-
-        // Add panic location as first related info (if different from test location)
-        if let Some(ref panic_loc) = failure.panic_location {
-            let panic_path = resolve_path(&panic_loc.file, workspace_root);
-            if let Ok(panic_uri) = Url::from_file_path(&panic_path) {
-                related_info.push(DiagnosticRelatedInformation {
-                    location: Location {
-                        uri: panic_uri,
-                        range: location_to_range(panic_loc),
-                    },
-                    message: format!("panicked here: {}", failure.message),
-                });
-            }
-        }
-
-        // Add backtrace frames
-        for frame in &failure.user_frames {
-            let frame_path = resolve_path(&frame.location.file, workspace_root);
-            if let Ok(frame_uri) = Url::from_file_path(&frame_path) {
-                related_info.push(DiagnosticRelatedInformation {
-                    location: Location {
-                        uri: frame_uri,
-                        range: location_to_range(&frame.location),
-                    },
-                    message: frame.function.clone(),
-                });
-            }
-        }
-
-        // Build a useful message
-        let message = if !failure.message.is_empty() {
+        // Build a useful message - only first line for the diagnostic
+        let full_message = if !failure.message.is_empty() {
             failure.message.clone()
         } else {
             // Try to extract something useful from full_output
             extract_failure_summary(&failure.full_output)
         };
+        let message = full_message
+            .lines()
+            .next()
+            .unwrap_or("Test failed")
+            .to_string();
 
-        let diagnostic = Diagnostic {
+        // Primary diagnostic on the test function (ERROR severity)
+        let primary_diagnostic = Diagnostic {
             range,
             severity: Some(DiagnosticSeverity::ERROR),
-            code: None, // No code needed - the diagnostic is on the test function itself
+            code: None,
             code_description: None,
             source: Some("squiggles".to_string()),
-            message,
-            related_information: if related_info.is_empty() {
-                None
-            } else {
-                Some(related_info)
-            },
+            message: message.clone(),
+            related_information: None,
             tags: None,
             data: None,
         };
 
-        diagnostics.entry(uri).or_default().push(diagnostic);
+        diagnostics
+            .entry(uri.clone())
+            .or_default()
+            .push(primary_diagnostic);
+
+        // Collect backtrace frame locations for deduplication
+        for frame in &failure.user_frames {
+            let frame_path = resolve_path(&frame.location.file, workspace_root);
+            if let Ok(frame_uri) = Url::from_file_path(&frame_path) {
+                let key = (frame_uri.to_string(), frame.location.line);
+                frame_locations
+                    .entry(key)
+                    .or_default()
+                    .push(short_name.clone());
+            }
+        }
+
+        // Collect panic location for deduplication
+        if let Some(ref panic_loc) = failure.panic_location {
+            let panic_path = resolve_path(&panic_loc.file, workspace_root);
+            if let Ok(panic_uri) = Url::from_file_path(&panic_path) {
+                // Only track if it's a different location than the test function
+                let panic_range = line_content_range(&panic_path, panic_loc.line)
+                    .unwrap_or_else(|| location_to_range(panic_loc));
+                if panic_uri != uri || panic_range != range {
+                    let key = (panic_uri.to_string(), panic_loc.line);
+                    panic_locations
+                        .entry(key)
+                        .or_default()
+                        .push(short_name.clone());
+                }
+            }
+        }
+    }
+
+    // Emit deduplicated HINT diagnostics for backtrace frames
+    for ((uri_str, line), test_names) in frame_locations {
+        let uri = match Url::parse(&uri_str) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let frame_range = line_content_range(&file_path, line).unwrap_or_else(|| Range {
+            start: Position {
+                line: line.saturating_sub(1),
+                character: 0,
+            },
+            end: Position {
+                line: line.saturating_sub(1),
+                character: 0,
+            },
+        });
+
+        let message = if test_names.len() == 1 {
+            format!("in call stack for `{}`", test_names[0])
+        } else {
+            format!("in call stack for {} tests", test_names.len())
+        };
+
+        let frame_diagnostic = Diagnostic {
+            range: frame_range,
+            severity: Some(DiagnosticSeverity::HINT),
+            code: None,
+            code_description: None,
+            source: Some("squiggles".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+        diagnostics.entry(uri).or_default().push(frame_diagnostic);
+    }
+
+    // Emit deduplicated WARNING diagnostics for panic locations
+    for ((uri_str, line), test_names) in panic_locations {
+        let uri = match Url::parse(&uri_str) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let file_path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let panic_range = line_content_range(&file_path, line).unwrap_or_else(|| Range {
+            start: Position {
+                line: line.saturating_sub(1),
+                character: 0,
+            },
+            end: Position {
+                line: line.saturating_sub(1),
+                character: 0,
+            },
+        });
+
+        let message = if test_names.len() == 1 {
+            format!("panicked here (from `{}`)", test_names[0])
+        } else {
+            format!("{} tests panicked here", test_names.len())
+        };
+
+        let panic_diagnostic = Diagnostic {
+            range: panic_range,
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: None,
+            code_description: None,
+            source: Some("squiggles".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            data: None,
+        };
+        diagnostics.entry(uri).or_default().push(panic_diagnostic);
     }
 
     diagnostics
@@ -200,6 +295,45 @@ fn location_to_range(loc: &SourceLocation) -> Range {
             character: col,
         },
     }
+}
+
+/// Compute a range that covers the non-whitespace content of a line.
+///
+/// Reads the file to find the actual line content, then returns a range
+/// from the first non-whitespace character to the end of the line.
+fn line_content_range(file_path: &Path, line_number: u32) -> Option<Range> {
+    let content = std::fs::read_to_string(file_path).ok()?;
+    let line_idx = line_number.saturating_sub(1) as usize;
+    let line = content.lines().nth(line_idx)?;
+
+    // Find first non-whitespace character
+    let start_col = line.chars().take_while(|c| c.is_whitespace()).count() as u32;
+    let end_col = line.len() as u32;
+
+    // If line is all whitespace, just return a point
+    if start_col >= end_col {
+        return Some(Range {
+            start: Position {
+                line: line_idx as u32,
+                character: 0,
+            },
+            end: Position {
+                line: line_idx as u32,
+                character: 0,
+            },
+        });
+    }
+
+    Some(Range {
+        start: Position {
+            line: line_idx as u32,
+            character: start_col,
+        },
+        end: Position {
+            line: line_idx as u32,
+            character: end_col,
+        },
+    })
 }
 
 /// Resolve a file path relative to the workspace root.

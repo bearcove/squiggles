@@ -548,7 +548,8 @@ impl LanguageServer for Backend {
 
         let state = self.state.read().await;
         if let Some(stored) = state.find_failure_at(&uri, position) {
-            let content = format_failure_hover(&stored.failure);
+            let workspace_root = state.workspace_root.as_deref();
+            let content = format_failure_hover(&stored.failure, workspace_root);
 
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -608,11 +609,11 @@ impl LanguageServer for Backend {
             if let Some((_, test_result)) = result {
                 match test_result {
                     TestResult::Passed => {
-                        // Simple pass hint after the function name
+                        // Simple pass hint after the #[test] attribute
                         hints.push(InlayHint {
                             position: Position {
-                                line: info.name_span.line,
-                                character: info.name_span.col + info.name_span.len,
+                                line: info.attr_span.line,
+                                character: info.attr_span.col + info.attr_span.len,
                             },
                             label: InlayHintLabel::String(" ✓ pass".to_string()),
                             kind: None,
@@ -624,11 +625,11 @@ impl LanguageServer for Backend {
                         });
                     }
                     TestResult::Failed(stored) => {
-                        // Fail hint after the function name
+                        // Fail hint after the #[test] attribute
                         hints.push(InlayHint {
                             position: Position {
-                                line: info.name_span.line,
-                                character: info.name_span.col + info.name_span.len,
+                                line: info.attr_span.line,
+                                character: info.attr_span.col + info.attr_span.len,
                             },
                             label: InlayHintLabel::String(" ✗ fail".to_string()),
                             kind: None,
@@ -642,82 +643,7 @@ impl LanguageServer for Backend {
                             data: None,
                         });
 
-                        // Add hints at each backtrace frame in this file
-                        for frame in &stored.failure.user_frames {
-                            // Check if this frame is in the current file
-                            let frame_file = frame
-                                .location
-                                .file
-                                .strip_prefix("./")
-                                .unwrap_or(&frame.location.file);
-                            if file_path.ends_with(frame_file) {
-                                let frame_line = frame.location.line.saturating_sub(1); // Convert to 0-indexed
-
-                                // Skip if outside requested range
-                                if frame_line < params.range.start.line
-                                    || frame_line > params.range.end.line
-                                {
-                                    continue;
-                                }
-
-                                hints.push(InlayHint {
-                                    position: Position {
-                                        line: frame_line,
-                                        character: 0, // Start of line for backtrace frames
-                                    },
-                                    label: InlayHintLabel::String(format!(
-                                        "← #{} {}",
-                                        frame.index,
-                                        frame
-                                            .function
-                                            .split("::")
-                                            .last()
-                                            .unwrap_or(&frame.function)
-                                    )),
-                                    kind: None,
-                                    text_edits: None,
-                                    tooltip: Some(InlayHintTooltip::String(format!(
-                                        "Backtrace frame #{}: {}",
-                                        frame.index, frame.function
-                                    ))),
-                                    padding_left: Some(true),
-                                    padding_right: Some(true),
-                                    data: None,
-                                });
-                            }
-                        }
-
-                        // Also add hint at panic location if it's in this file
-                        if let Some(ref panic_loc) = stored.failure.panic_location {
-                            let panic_file =
-                                panic_loc.file.strip_prefix("./").unwrap_or(&panic_loc.file);
-                            if file_path.ends_with(panic_file) {
-                                let panic_line = panic_loc.line.saturating_sub(1);
-
-                                if panic_line >= params.range.start.line
-                                    && panic_line <= params.range.end.line
-                                    && panic_line != info.name_span.line
-                                // Don't duplicate if same line
-                                {
-                                    hints.push(InlayHint {
-                                        position: Position {
-                                            line: panic_line,
-                                            character: 0,
-                                        },
-                                        label: InlayHintLabel::String("← panic here".to_string()),
-                                        kind: None,
-                                        text_edits: None,
-                                        tooltip: Some(InlayHintTooltip::String(format!(
-                                            "Panicked: {}",
-                                            stored.failure.message
-                                        ))),
-                                        padding_left: Some(true),
-                                        padding_right: Some(true),
-                                        data: None,
-                                    });
-                                }
-                            }
-                        }
+                        // Backtrace frames are now shown as separate diagnostics, not inlay hints
                     }
                 }
             }
@@ -828,11 +754,18 @@ pub fn find_test_functions_detailed(content: &str) -> Vec<TestFunctionInfo> {
             // Scan inside the attribute for "test" identifier
             let mut depth = 1;
             let mut has_test = false;
+            let mut attr_end_offset = attr_offset + 1; // Default to just after '#'
 
             while i < tokens.len() && depth > 0 {
                 match tokens[i].1 {
                     TokenKind::OpenBracket | TokenKind::OpenParen => depth += 1,
-                    TokenKind::CloseBracket | TokenKind::CloseParen => depth -= 1,
+                    TokenKind::CloseBracket | TokenKind::CloseParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            // Record the end of the attribute (after the ']')
+                            attr_end_offset = tokens[i].0 + tokens[i].2.len();
+                        }
+                    }
                     TokenKind::Ident if tokens[i].2 == "test" => has_test = true,
                     _ => {}
                 }
@@ -884,11 +817,12 @@ pub fn find_test_functions_detailed(content: &str) -> Vec<TestFunctionInfo> {
                                 let fn_name = tokens[i].2;
                                 let (name_line, name_col) = offset_to_line_col(fn_name_offset);
                                 let (attr_line, attr_col) = offset_to_line_col(attr_offset);
+                                let attr_len = (attr_end_offset - attr_offset) as u32;
                                 results.push(TestFunctionInfo {
                                     attr_span: Span {
                                         line: attr_line,
                                         col: attr_col,
-                                        len: 1, // Just the '#' for now
+                                        len: attr_len,
                                     },
                                     name_span: Span {
                                         line: name_line,
@@ -1136,7 +1070,7 @@ async fn test_runner_loop(
                                     loc.uri.clone(),
                                     StoredFailure {
                                         failure: f.clone(),
-                                        range: loc.name_span.to_range(),
+                                        range: loc.attr_span.to_range(),
                                     },
                                 ))
                             } else if let Some(loc) = f.panic_location.as_ref() {
@@ -1169,7 +1103,7 @@ async fn test_runner_loop(
                                 failure.name.clone(),
                                 TestResult::Failed(StoredFailure {
                                     failure: failure.clone(),
-                                    range: test_loc.name_span.to_range(),
+                                    range: test_loc.attr_span.to_range(),
                                 }),
                             );
                         } else if let Some(loc) = &failure.panic_location {
@@ -1256,8 +1190,10 @@ async fn test_runner_loop(
 /// Format a test failure for hover display.
 ///
 /// Extracts the relevant information from color-backtrace or standard backtrace output
-/// and formats it as markdown for the hover popup.
-fn format_failure_hover(failure: &TestFailure) -> String {
+/// and formats it as markdown for the hover popup with clickable file links.
+fn format_failure_hover(failure: &TestFailure, workspace_root: Option<&std::path::Path>) -> String {
+    use std::path::Path;
+
     let output = &failure.full_output;
     let mut result = String::new();
 
@@ -1270,25 +1206,74 @@ fn format_failure_hover(failure: &TestFailure) -> String {
         "Test failed".to_string()
     };
 
-    result.push_str("**");
+    result.push_str("```\n");
     result.push_str(&message);
-    result.push_str("**\n\n");
+    result.push_str("\n```\n\n");
+
+    // Helper to make path relative to workspace
+    let relative_path = |file: &str| -> String {
+        if let Some(root) = workspace_root {
+            if Path::new(file).is_absolute() {
+                // Try to make it relative to workspace
+                if let Ok(rel) = Path::new(file).strip_prefix(root) {
+                    return rel.display().to_string();
+                }
+            }
+        }
+        file.strip_prefix("./").unwrap_or(file).to_string()
+    };
+
+    // Helper to get absolute path for file:// URI
+    let absolute_path = |file: &str| -> String {
+        if let Some(root) = workspace_root {
+            if Path::new(file).is_absolute() {
+                file.to_string()
+            } else {
+                let clean = file.strip_prefix("./").unwrap_or(file);
+                root.join(clean).display().to_string()
+            }
+        } else {
+            file.to_string()
+        }
+    };
+
+    // Helper to read a line from a file
+    let read_line = |file: &str, line: u32| -> Option<String> {
+        let abs_path = absolute_path(file);
+        let content = std::fs::read_to_string(&abs_path).ok()?;
+        let line_content = content.lines().nth(line.saturating_sub(1) as usize)?;
+        Some(line_content.trim().to_string())
+    };
+
+    // Helper to make a clickable file link with line preview
+    let make_link = |file: &str, line: u32| -> String {
+        let rel = relative_path(file);
+        let abs = absolute_path(file);
+        // VSCode/Zed support file:// URIs with line numbers
+        format!("[{}:{}](file://{}#{})", rel, line, abs, line)
+    };
 
     // Add location if available
     if let Some(ref loc) = failure.panic_location {
-        result.push_str(&format!("at `{}:{}`\n\n", loc.file, loc.line));
+        result.push_str(&format!("at {}\n\n", make_link(&loc.file, loc.line)));
     }
 
     // Add relevant backtrace frames (user code only)
     if !failure.user_frames.is_empty() {
-        result.push_str("**Backtrace:**\n");
+        result.push_str("**Backtrace:**\n\n");
         for frame in &failure.user_frames {
-            // Format: #N function at file:line
+            // Format: #N function at file:line (clickable) with syntax-highlighted code
             let short_fn = frame.function.split("::").last().unwrap_or(&frame.function);
             result.push_str(&format!(
-                "- #{} `{}` at `{}:{}`\n",
-                frame.index, short_fn, frame.location.file, frame.location.line
+                "#{} `{}` at {}\n",
+                frame.index,
+                short_fn,
+                make_link(&frame.location.file, frame.location.line)
             ));
+            if let Some(line_content) = read_line(&frame.location.file, frame.location.line) {
+                result.push_str(&format!("```rust\n{}\n```\n", line_content));
+            }
+            result.push('\n');
         }
     }
 
@@ -1708,8 +1693,8 @@ fn test_with_parens() {}
                 full_output: String::new(),
             };
 
-            let hover = format_failure_hover(&failure);
-            assert!(hover.contains("**assertion failed**"));
+            let hover = format_failure_hover(&failure, None);
+            assert!(hover.contains("assertion failed"));
             assert!(hover.contains("src/lib.rs:42"));
         }
 
@@ -1746,7 +1731,7 @@ fn test_with_parens() {}
                 full_output: String::new(),
             };
 
-            let hover = format_failure_hover(&failure);
+            let hover = format_failure_hover(&failure, None);
             assert!(hover.contains("**Backtrace:**"));
             assert!(hover.contains("#14"));
             assert!(hover.contains("`inner_fn`"));
@@ -1763,8 +1748,8 @@ fn test_with_parens() {}
                 full_output: "The application panicked (crashed).\nMessage:  custom error from color-backtrace\nLocation: src/lib.rs:5\n".to_string(),
             };
 
-            let hover = format_failure_hover(&failure);
-            assert!(hover.contains("**custom error from color-backtrace**"));
+            let hover = format_failure_hover(&failure, None);
+            assert!(hover.contains("custom error from color-backtrace"));
         }
     }
 }
