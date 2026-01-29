@@ -2,7 +2,7 @@
 
 A standalone LSP that continuously runs Rust tests and surfaces failures as editor diagnostics. Test failures appear as squiggly underlines, just like compiler errors.
 
-<img width="1720" height="1520" alt="Image" src="https://github.com/user-attachments/assets/a6c51f33-ee4c-40df-907f-598171943cc0" />
+<img width="1720" height="1520" alt="Squiggles working in Zed, showing a test failure" src="https://github.com/user-attachments/assets/a6c51f33-ee4c-40df-907f-598171943cc0" />
 
 ## What it does
 

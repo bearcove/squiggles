@@ -1280,7 +1280,6 @@ dependencies = [
 name = "squiggles"
 version = "0.1.0"
 dependencies = [
- "dirs",
  "facet",
  "facet-json",
  "facet-styx",
@@ -1289,6 +1288,7 @@ dependencies = [
  "notify",
  "rustc_lexer",
  "serde_json",
+ "squiggles-config",
  "strip-ansi-escapes",
  "styx-embed",
  "tempfile",
@@ -1296,6 +1296,14 @@ dependencies = [
  "tower",
  "tower-lsp",
  "tracing",
+]
+
+[[package]]
+name = "squiggles-config"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "facet",
 ]
 
 [[package]]

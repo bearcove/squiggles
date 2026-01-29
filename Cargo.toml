@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "crates/squiggles-config"]
 exclude = ["editors/zed-squiggles", "test-fixtures/sample-crate"]
 
 [package]
@@ -8,6 +8,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Config crate (shared with build.rs)
+squiggles-config = { path = "crates/squiggles-config" }
+
 # Facet ecosystem
 facet = { git = "https://github.com/facet-rs/facet", branch = "main", features = ["alloc"] }
 facet-json = { git = "https://github.com/facet-rs/facet", branch = "main" }
@@ -36,10 +39,9 @@ strip-ansi-escapes = "0.2"
 
 # Schema embedding
 styx-embed = { git = "https://github.com/bearcove/styx", branch = "main" }
-dirs = "6.0.0"
 
 [build-dependencies]
-facet = { git = "https://github.com/facet-rs/facet", branch = "main", features = ["alloc"] }
+squiggles-config = { path = "crates/squiggles-config" }
 facet-styx = { git = "https://github.com/bearcove/styx", branch = "main" }
 
 [dev-dependencies]
