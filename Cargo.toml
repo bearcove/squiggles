@@ -1,5 +1,6 @@
 [workspace]
 members = ["xtask"]
+exclude = ["editors/zed-squiggles"]
 
 [package]
 name = "squiggles"
