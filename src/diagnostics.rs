@@ -3,20 +3,33 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 
+use file_rotate::{ContentLimit, FileRotate, compression::Compression, suffix::AppendCount};
 use tower_lsp::lsp_types::*;
 
 use crate::lsp::{Span, find_test_functions_detailed};
 use crate::nextest::{SourceLocation, TestFailure};
 
-/// Write debug info to /tmp/squiggles-debug.log
+/// Global rotating log file
+static DEBUG_LOG: OnceLock<std::sync::Mutex<FileRotate<AppendCount>>> = OnceLock::new();
+
+fn get_debug_log() -> &'static std::sync::Mutex<FileRotate<AppendCount>> {
+    DEBUG_LOG.get_or_init(|| {
+        std::sync::Mutex::new(FileRotate::new(
+            "/tmp/squiggles-debug.log",
+            AppendCount::new(3),              // Keep 3 rotated files
+            ContentLimit::Bytes(1024 * 1024), // Rotate at 1MB
+            Compression::None,
+            None,
+        ))
+    })
+}
+
+/// Write debug info to /tmp/squiggles-debug.log (with rotation)
 pub fn debug_log(msg: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/squiggles-debug.log")
-    {
-        let _ = writeln!(f, "{}", msg);
+    if let Ok(mut log) = get_debug_log().lock() {
+        let _ = writeln!(log, "{}", msg);
     }
 }
 
@@ -115,10 +128,10 @@ fn walkdir_inner(
 ) -> std::io::Result<()> {
     if dir.is_dir() {
         // Skip target directory and hidden directories
-        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-            if name == "target" || name.starts_with('.') {
-                return Ok(());
-            }
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str())
+            && (name == "target" || name.starts_with('.'))
+        {
+            return Ok(());
         }
 
         // Check exclude patterns against the relative path from root

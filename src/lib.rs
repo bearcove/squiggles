@@ -6,6 +6,7 @@
 pub mod config;
 pub mod diagnostics;
 pub mod lsp;
+pub mod metadata;
 pub mod nextest;
 pub mod progress;
 pub mod runner;

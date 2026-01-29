@@ -10,6 +10,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::config::Config;
+use crate::metadata::WorkspaceMetadata;
 use crate::nextest::TestFailure;
 use crate::progress::ProgressHandle;
 use crate::watcher::{FileWatcher, WatcherEvent};
@@ -66,6 +67,8 @@ pub struct ServerState {
     pub config: Config,
     /// Workspace root path (set during initialization).
     pub workspace_root: Option<PathBuf>,
+    /// Cargo workspace metadata for resolving crate-relative paths.
+    pub workspace_metadata: Option<WorkspaceMetadata>,
     /// Test failures indexed by file URI for hover lookup.
     /// Maps URI string -> list of failures in that file.
     pub failures: HashMap<String, Vec<StoredFailure>>,
@@ -148,6 +151,7 @@ impl Backend {
             state: Arc::new(RwLock::new(ServerState {
                 config,
                 workspace_root: None,
+                workspace_metadata: None,
                 failures: HashMap::new(),
                 files_with_diagnostics: HashSet::new(),
                 test_results: HashMap::new(),
@@ -415,11 +419,12 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Store workspace root
+        // Store workspace root and load cargo metadata
         if let Some(root_uri) = params.root_uri
             && let Ok(path) = root_uri.to_file_path()
         {
             let mut state = self.state.write().await;
+            state.workspace_metadata = WorkspaceMetadata::load(&path);
             state.workspace_root = Some(path);
         }
 
@@ -589,7 +594,8 @@ impl LanguageServer for Backend {
         let state = self.state.read().await;
         if let Some(stored) = state.find_failure_at(&uri, position) {
             let workspace_root = state.workspace_root.as_deref();
-            let content = format_failure_hover(&stored.failure, workspace_root);
+            let workspace_metadata = state.workspace_metadata.as_ref();
+            let content = format_failure_hover(&stored.failure, workspace_root, workspace_metadata);
 
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
@@ -1323,7 +1329,11 @@ async fn test_runner_loop(
 ///
 /// Extracts the relevant information from color-backtrace or standard backtrace output
 /// and formats it as markdown for the hover popup with clickable file links.
-fn format_failure_hover(failure: &TestFailure, workspace_root: Option<&std::path::Path>) -> String {
+fn format_failure_hover(
+    failure: &TestFailure,
+    workspace_root: Option<&std::path::Path>,
+    workspace_metadata: Option<&WorkspaceMetadata>,
+) -> String {
     use std::path::Path;
 
     let output = &failure.full_output;
@@ -1342,103 +1352,173 @@ fn format_failure_hover(failure: &TestFailure, workspace_root: Option<&std::path
     result.push_str(&message);
     result.push_str("\n```\n\n");
 
-    // Helper to make path relative to workspace
-    let relative_path = |file: &str| -> String {
-        if let Some(root) = workspace_root
-            && Path::new(file).is_absolute()
-            && let Ok(rel) = Path::new(file).strip_prefix(root)
+    // Helper to resolve a crate-relative path using workspace metadata
+    let resolve_path = |file: &str, function: Option<&str>| -> Option<std::path::PathBuf> {
+        // If already absolute and exists, use it
+        if Path::new(file).is_absolute() && Path::new(file).exists() {
+            return Some(file.into());
+        }
+
+        // Try using workspace metadata to resolve via crate name
+        if let Some(meta) = workspace_metadata
+            && let Some(func) = function
         {
-            return rel.display().to_string();
-        }
-        file.strip_prefix("./").unwrap_or(file).to_string()
-    };
-
-    // Helper to get absolute path for file:// URI
-    let absolute_path = |file: &str| -> String {
-        if let Some(root) = workspace_root {
-            if Path::new(file).is_absolute() {
-                file.to_string()
-            } else {
-                let clean = file.strip_prefix("./").unwrap_or(file);
-                root.join(clean).display().to_string()
-            }
-        } else {
-            file.to_string()
-        }
-    };
-
-    // Helper to find a file in the workspace by searching for it
-    fn find_file_recursive(dir: &Path, suffix: &Path, results: &mut Vec<std::path::PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Skip target and hidden dirs
-                    if path.is_dir() && (name == "target" || name.starts_with('.')) {
-                        continue;
-                    }
-                }
-                if path.is_dir() {
-                    find_file_recursive(&path, suffix, results);
-                } else if path.ends_with(suffix) {
-                    results.push(path);
-                }
+            if let Some(resolved) = meta.resolve_frame_path(func, file) {
+                crate::diagnostics::debug_log(&format!(
+                    "resolve_path: '{}' via function '{}' -> {}",
+                    file,
+                    func,
+                    resolved.display()
+                ));
+                return Some(resolved);
             }
         }
-    }
 
-    let find_file = |file: &str| -> Option<std::path::PathBuf> {
-        // First try the direct path
-        let abs_path = absolute_path(file);
-        if Path::new(&abs_path).exists() {
-            return Some(abs_path.into());
-        }
-        // If not found and we have a workspace root, search for the file
+        // Fall back to workspace root join
         if let Some(root) = workspace_root {
-            let suffix = Path::new(file);
-            let mut results = Vec::new();
-            find_file_recursive(root, suffix, &mut results);
-            // Return the first match (there should only be one)
-            return results.into_iter().next();
+            let clean = file.strip_prefix("./").unwrap_or(file);
+            let joined = root.join(clean);
+            if joined.exists() {
+                return Some(joined);
+            }
         }
+
+        crate::diagnostics::debug_log(&format!("resolve_path: '{}' -> not found", file));
         None
     };
 
-    // Helper to read a line from a file
-    let read_line = |file: &str, line: u32| -> Option<String> {
-        let path = find_file(file)?;
-        let content = std::fs::read_to_string(&path).ok()?;
-        let line_content = content.lines().nth(line.saturating_sub(1) as usize)?;
-        Some(line_content.trim().to_string())
+    // Helper to make path relative to workspace for display
+    let relative_path = |path: &Path| -> String {
+        if let Some(root) = workspace_root
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            return rel.display().to_string();
+        }
+        path.display().to_string()
     };
 
-    // Helper to make a clickable file link with line preview
-    let make_link = |file: &str, line: u32| -> String {
-        let rel = relative_path(file);
-        let abs = absolute_path(file);
-        // VSCode/Zed support file:// URIs with line numbers
+    // Helper to read a complete expression from a file starting at a line.
+    // Uses rustc_lexer to find balanced parentheses/brackets/braces.
+    // Preserves indentation and caps at 3 lines.
+    let read_expression = |path: &Path, line: u32| -> Option<String> {
+        use rustc_lexer::{TokenKind, tokenize};
+
+        let content = std::fs::read_to_string(path).ok()?;
+        let lines: Vec<&str> = content.lines().collect();
+        let line_idx = line.saturating_sub(1) as usize;
+
+        if line_idx >= lines.len() {
+            return None;
+        }
+
+        // Get the starting line (preserve original indentation)
+        let first_line = lines[line_idx];
+
+        // Tokenize the first line to see if parens are balanced
+        let mut depth = 0i32;
+        for token in tokenize(first_line) {
+            match token.kind {
+                TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                    depth += 1;
+                }
+                TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+
+        // If balanced, just return the single line
+        if depth == 0 {
+            return Some(first_line.to_string());
+        }
+
+        // Otherwise, accumulate lines until balanced (max 3 lines)
+        let mut result_lines = vec![first_line];
+        let mut current_line = line_idx + 1;
+        const MAX_LINES: usize = 3;
+
+        while depth > 0 && current_line < lines.len() && result_lines.len() < MAX_LINES {
+            let next_line = lines[current_line];
+            result_lines.push(next_line);
+
+            for token in tokenize(next_line) {
+                match token.kind {
+                    TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                        depth += 1;
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            current_line += 1;
+        }
+
+        // If we hit the limit and still unbalanced, add ellipsis
+        let mut result = result_lines.join("\n");
+        if depth > 0 {
+            result.push_str("\n    ...");
+        }
+
+        Some(result)
+    };
+
+    // Helper to make a clickable file link
+    let make_link = |path: &Path, line: u32| -> String {
+        let rel = relative_path(path);
+        let abs = path.display();
         format!("[{}:{}](file://{}#{})", rel, line, abs, line)
     };
 
     // Add location if available
     if let Some(ref loc) = failure.panic_location {
-        result.push_str(&format!("at {}\n\n", make_link(&loc.file, loc.line)));
+        // For panic location, use the first user frame's function name if available
+        let func = failure.user_frames.first().map(|f| f.function.as_str());
+        if let Some(path) = resolve_path(&loc.file, func) {
+            result.push_str(&format!("at {}\n\n", make_link(&path, loc.line)));
+        } else {
+            // Fallback to raw path
+            let clean = loc.file.strip_prefix("./").unwrap_or(&loc.file);
+            result.push_str(&format!("at {}:{}\n\n", clean, loc.line));
+        }
     }
 
     // Add relevant backtrace frames (user code only)
     if !failure.user_frames.is_empty() {
         result.push_str("**Backtrace:**\n\n");
         for frame in &failure.user_frames {
-            // Format: #N function at file:line (clickable) with syntax-highlighted code
             let short_fn = frame.function.split("::").last().unwrap_or(&frame.function);
-            result.push_str(&format!(
-                "#{} `{}` at {}\n",
-                frame.index,
-                short_fn,
-                make_link(&frame.location.file, frame.location.line)
-            ));
-            if let Some(line_content) = read_line(&frame.location.file, frame.location.line) {
-                result.push_str(&format!("```rust\n{}\n```\n", line_content));
+
+            if let Some(path) = resolve_path(&frame.location.file, Some(&frame.function)) {
+                result.push_str(&format!(
+                    "◈ #{} `{}` at {}\n",
+                    frame.index,
+                    short_fn,
+                    make_link(&path, frame.location.line)
+                ));
+                if let Some(expr) = read_expression(&path, frame.location.line) {
+                    // Format as blockquote with code block inside
+                    result.push_str("> ```rust\n");
+                    for line in expr.lines() {
+                        result.push_str("> ");
+                        result.push_str(line);
+                        result.push('\n');
+                    }
+                    result.push_str("> ```\n");
+                }
+            } else {
+                // Fallback to raw path
+                let clean = frame
+                    .location
+                    .file
+                    .strip_prefix("./")
+                    .unwrap_or(&frame.location.file);
+                result.push_str(&format!(
+                    "◈ #{} `{}` at {}:{}\n",
+                    frame.index, short_fn, clean, frame.location.line
+                ));
             }
             result.push('\n');
         }
@@ -1860,7 +1940,7 @@ fn test_with_parens() {}
                 full_output: String::new(),
             };
 
-            let hover = format_failure_hover(&failure, None);
+            let hover = format_failure_hover(&failure, None, None);
             assert!(hover.contains("assertion failed"));
             assert!(hover.contains("src/lib.rs:42"));
         }
@@ -1898,7 +1978,7 @@ fn test_with_parens() {}
                 full_output: String::new(),
             };
 
-            let hover = format_failure_hover(&failure, None);
+            let hover = format_failure_hover(&failure, None, None);
             assert!(hover.contains("**Backtrace:**"));
             assert!(hover.contains("#14"));
             assert!(hover.contains("`inner_fn`"));
@@ -1915,7 +1995,7 @@ fn test_with_parens() {}
                 full_output: "The application panicked (crashed).\nMessage:  custom error from color-backtrace\nLocation: src/lib.rs:5\n".to_string(),
             };
 
-            let hover = format_failure_hover(&failure, None);
+            let hover = format_failure_hover(&failure, None, None);
             assert!(hover.contains("custom error from color-backtrace"));
         }
     }
