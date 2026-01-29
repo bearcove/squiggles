@@ -245,7 +245,6 @@ pub async fn run_tests_verbose(
                             }
                             nextest::TestEvent::Failed { name, stdout, .. } => {
                                 if let Some(failure) = test_event.parse_failure() {
-                                    let has_loc = failure.panic_location.is_some();
                                     let loc_info = if let Some(ref loc) = failure.panic_location {
                                         format!(" at {}:{}:{}", loc.file, loc.line, loc.column)
                                     } else {

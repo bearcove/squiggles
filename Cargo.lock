@@ -1229,6 +1229,7 @@ dependencies = [
  "notify",
  "rustc_lexer",
  "serde_json",
+ "strip-ansi-escapes",
  "styx-embed",
  "tempfile",
  "tokio",

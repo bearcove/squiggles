@@ -235,22 +235,8 @@ fn parse_panic_header(stdout: &str) -> (String, Option<SourceLocation>) {
 
 /// Strip ANSI escape codes from a string.
 fn strip_ansi_codes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
-
-    for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if c == 'm' {
-                in_escape = false;
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
+    let stripped = strip_ansi_escapes::strip(s);
+    String::from_utf8_lossy(&stripped).into_owned()
 }
 
 /// Parse a location string like "file:line" (no column).
