@@ -31,6 +31,11 @@ pub struct TestFunctionIndex {
 impl TestFunctionIndex {
     /// Build an index by scanning all Rust files in the workspace.
     pub fn build(workspace_root: &Path) -> Self {
+        Self::build_with_excludes(workspace_root, &[])
+    }
+
+    /// Build an index, excluding directories matching the given patterns.
+    pub fn build_with_excludes(workspace_root: &Path, exclude_patterns: &[String]) -> Self {
         let mut by_name = HashMap::new();
 
         // Canonicalize workspace root to ensure all paths are absolute
@@ -41,7 +46,7 @@ impl TestFunctionIndex {
         };
 
         // Walk the workspace looking for .rs files
-        if let Ok(entries) = walkdir(&workspace_root) {
+        if let Ok(entries) = walkdir(&workspace_root, exclude_patterns) {
             for entry in entries {
                 if entry.extension().is_some_and(|e| e == "rs")
                     && let Ok(content) = std::fs::read_to_string(&entry)
@@ -72,26 +77,34 @@ impl TestFunctionIndex {
 }
 
 /// Walk a directory recursively, yielding file paths.
-fn walkdir(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+fn walkdir(root: &Path, exclude_patterns: &[String]) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
-    walkdir_inner(root, &mut files)?;
+    walkdir_inner(root, &mut files, exclude_patterns)?;
     Ok(files)
 }
 
-fn walkdir_inner(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+fn walkdir_inner(
+    dir: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+    exclude_patterns: &[String],
+) -> std::io::Result<()> {
     if dir.is_dir() {
         // Skip target directory and hidden directories
-        if let Some(name) = dir.file_name().and_then(|n| n.to_str())
-            && (name == "target" || name.starts_with('.'))
-        {
-            return Ok(());
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            if name == "target" || name.starts_with('.') {
+                return Ok(());
+            }
+            // Skip directories matching exclude patterns
+            if exclude_patterns.iter().any(|p| name == p) {
+                return Ok(());
+            }
         }
 
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                walkdir_inner(&path, files)?;
+                walkdir_inner(&path, files, exclude_patterns)?;
             } else {
                 files.push(path);
             }

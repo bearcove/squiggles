@@ -36,6 +36,14 @@ pub struct Config {
     /// build artifacts across projects.
     #[facet(default)]
     pub captain: bool,
+
+    /// Directory patterns to exclude from scanning for test functions.
+    /// Use this to skip vendored code, submodules, or other directories
+    /// that contain duplicate test function names.
+    /// Patterns are matched against directory names (not full paths).
+    /// Examples: `("vendor" "third_party" "editors")`
+    #[facet(default)]
+    pub scan_exclude: Option<Vec<String>>,
 }
 
 impl Config {

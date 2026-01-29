@@ -1173,7 +1173,9 @@ async fn test_runner_loop(
                 client.log_message(MessageType::INFO, &summary).await;
 
                 // Build test function index and convert failures to diagnostics
-                let test_index = TestFunctionIndex::build(&workspace_root);
+                let scan_exclude = config.scan_exclude.as_deref().unwrap_or(&[]);
+                let test_index =
+                    TestFunctionIndex::build_with_excludes(&workspace_root, scan_exclude);
                 let diagnostics_by_file =
                     failures_to_diagnostics(&result.failures, &workspace_root, &test_index);
 
