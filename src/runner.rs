@@ -151,18 +151,20 @@ fn parse_build_progress(line: &str) -> Option<BuildProgress> {
 /// This function reads both stdout and stderr concurrently, so it won't hang
 /// even if the build fails and produces no JSON output.
 pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
-    run_tests_verbose(workspace_root, config, None, CancellationToken::new()).await
+    run_tests_verbose(workspace_root, config, None, CancellationToken::new(), None).await
 }
 
 /// Run tests with verbose logging via a channel.
 ///
 /// If `log_tx` is provided, log events will be sent as they happen.
 /// If `cancel` is triggered, the test process will be killed.
+/// If `package_filter` is provided, only run tests for that package and its rdeps.
 pub async fn run_tests_verbose(
     workspace_root: &Path,
     config: &Config,
     log_tx: Option<mpsc::Sender<RunLogEvent>>,
     cancel: CancellationToken,
+    package_filter: Option<&str>,
 ) -> RunOutcome {
     let start_time = Instant::now();
 
@@ -180,10 +182,28 @@ pub async fn run_tests_verbose(
         args.push(target_dir.display().to_string());
     }
 
-    // Add filter expression if configured
+    // Build the filter expression
+    let mut filter_parts = Vec::new();
+
+    // Add package filter (rdeps) if specified
+    if let Some(package) = package_filter {
+        filter_parts.push(format!("rdeps({package})"));
+    }
+
+    // Add user's filter expression if configured
     if let Some(ref filter) = config.filter {
+        filter_parts.push(filter.clone());
+    }
+
+    // Combine filters with AND if both are present
+    if !filter_parts.is_empty() {
+        let combined = if filter_parts.len() == 1 {
+            filter_parts.pop().unwrap()
+        } else {
+            format!("({}) & ({})", filter_parts[0], filter_parts[1])
+        };
         args.push("-E".to_string());
-        args.push(filter.clone());
+        args.push(combined);
     }
 
     let command_str = format!("cargo {}", args.join(" "));

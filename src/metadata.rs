@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use cargo_metadata::MetadataCommand;
 
 /// Cached workspace metadata for resolving crate-relative paths.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WorkspaceMetadata {
     /// Workspace root directory
     pub workspace_root: PathBuf,
@@ -73,6 +73,29 @@ impl WorkspaceMetadata {
     pub fn resolve_frame_path(&self, function: &str, relative_path: &str) -> Option<PathBuf> {
         let crate_name = Self::extract_crate_name(function)?;
         self.resolve_path(crate_name, relative_path)
+    }
+
+    /// Find the package name containing the given file path.
+    ///
+    /// Returns the package name with hyphens (as used by cargo/nextest).
+    pub fn package_for_file(&self, file_path: &Path) -> Option<String> {
+        // Canonicalize the file path for consistent comparison
+        let file_path = file_path.canonicalize().ok()?;
+
+        // Find the package whose root is a prefix of the file path
+        for (name_underscored, crate_root) in &self.by_name {
+            let crate_root = match crate_root.canonicalize() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if file_path.starts_with(&crate_root) {
+                // Convert back from underscores to hyphens for cargo/nextest
+                return Some(name_underscored.replace('_', "-"));
+            }
+        }
+
+        None
     }
 }
 

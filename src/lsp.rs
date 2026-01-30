@@ -140,12 +140,17 @@ pub struct Backend {
     /// Shared server state.
     state: Arc<RwLock<ServerState>>,
     /// Channel to trigger test runs (sent when files are saved).
-    test_trigger: mpsc::Sender<()>,
+    /// Contains the path of the file that was saved, or None for a full run.
+    test_trigger: mpsc::Sender<Option<PathBuf>>,
 }
 
 impl Backend {
     /// Create a new backend with the given client and configuration.
-    pub fn new(client: Client, config: Config, test_trigger: mpsc::Sender<()>) -> Self {
+    pub fn new(
+        client: Client,
+        config: Config,
+        test_trigger: mpsc::Sender<Option<PathBuf>>,
+    ) -> Self {
         Self {
             client,
             state: Arc::new(RwLock::new(ServerState {
@@ -237,8 +242,8 @@ impl Backend {
                                             format!("File changed (debounced): {}", path.display()),
                                         )
                                         .await;
-                                    // Trigger test run
-                                    let _ = test_trigger.send(()).await;
+                                    // Trigger test run with the saved file path
+                                    let _ = test_trigger.send(Some(path)).await;
                                 }
                                 WatcherEvent::Error(e) => {
                                     client
@@ -267,8 +272,8 @@ impl Backend {
             }
         }
 
-        // Trigger initial test run
-        let _ = self.test_trigger.send(()).await;
+        // Trigger initial test run (full workspace)
+        let _ = self.test_trigger.send(None).await;
     }
 
     /// Reload config from disk and update state.
@@ -448,7 +453,7 @@ impl Backend {
                                                 ),
                                             )
                                             .await;
-                                        let _ = test_trigger.send(()).await;
+                                        let _ = test_trigger.send(Some(path)).await;
                                     }
                                     WatcherEvent::Error(e) => {
                                         watcher_client
@@ -468,8 +473,8 @@ impl Backend {
                     }
                 }
 
-                // Trigger initial test run
-                let _ = test_trigger.send(()).await;
+                // Trigger initial test run (full workspace)
+                let _ = test_trigger.send(None).await;
 
                 // Stop watching for config - we're now active
                 break;
@@ -635,7 +640,8 @@ impl LanguageServer for Backend {
 
         // The file watcher handles debouncing, but we also trigger here
         // in case the watcher missed it (e.g., external editor)
-        let _ = self.test_trigger.send(()).await;
+        let path = uri.to_file_path().ok();
+        let _ = self.test_trigger.send(path).await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -1063,8 +1069,8 @@ pub async fn run(config: Config) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    // Channel for triggering test runs
-    let (test_tx, test_rx) = mpsc::channel::<()>(16);
+    // Channel for triggering test runs (carries the saved file path, or None for full run)
+    let (test_tx, test_rx) = mpsc::channel::<Option<PathBuf>>(16);
 
     let (service, socket) = LspService::build(|client| {
         let backend = Backend::new(client, config, test_tx);
@@ -1087,7 +1093,7 @@ pub async fn run(config: Config) {
 /// This receives signals from the file watcher (debounced) and did_save,
 /// runs cargo nextest, parses the output, and publishes diagnostics.
 async fn test_runner_loop(
-    mut rx: mpsc::Receiver<()>,
+    mut rx: mpsc::Receiver<Option<PathBuf>>,
     state: Arc<RwLock<ServerState>>,
     client: Client,
 ) {
@@ -1098,19 +1104,28 @@ async fn test_runner_loop(
     // Token to cancel the current test run
     let mut current_cancel: Option<CancellationToken> = None;
 
-    while rx.recv().await.is_some() {
+    while let Some(saved_file) = rx.recv().await {
         // Cancel any running test
         if let Some(cancel) = current_cancel.take() {
             cancel.cancel();
         }
-        // Drain any pending triggers (debounce)
-        while rx.try_recv().is_ok() {}
+        // Drain any pending triggers and keep the most recent file path
+        let mut saved_file = saved_file;
+        while let Ok(newer) = rx.try_recv() {
+            if newer.is_some() {
+                saved_file = newer;
+            }
+        }
 
-        // Get workspace root and config
-        let (workspace_root, config) = {
+        // Get workspace root, config, and metadata
+        let (workspace_root, config, workspace_metadata) = {
             let state_guard = state.read().await;
             match &state_guard.workspace_root {
-                Some(root) => (root.clone(), state_guard.config.clone()),
+                Some(root) => (
+                    root.clone(),
+                    state_guard.config.clone(),
+                    state_guard.workspace_metadata.clone(),
+                ),
                 None => {
                     client
                         .log_message(
@@ -1122,6 +1137,22 @@ async fn test_runner_loop(
                 }
             }
         };
+
+        // Determine which package to test based on the saved file
+        let package_filter: Option<String> = saved_file.as_ref().and_then(|path| {
+            workspace_metadata
+                .as_ref()
+                .and_then(|meta| meta.package_for_file(path))
+        });
+
+        if let Some(ref pkg) = package_filter {
+            client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Running tests for package: {pkg} (and rdeps)"),
+                )
+                .await;
+        }
 
         // Start progress indicator
         let progress =
@@ -1299,7 +1330,14 @@ async fn test_runner_loop(
         current_cancel = Some(cancel.clone());
 
         // Run tests - this always completes, never hangs
-        let outcome = run_tests_verbose(&workspace_root, &config, Some(log_tx), cancel).await;
+        let outcome = run_tests_verbose(
+            &workspace_root,
+            &config,
+            Some(log_tx),
+            cancel,
+            package_filter.as_deref(),
+        )
+        .await;
 
         // Wait for log task to finish
         let _ = log_task.await;
