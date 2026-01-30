@@ -10,16 +10,11 @@ pub struct Config {
     #[facet(default)]
     pub enabled: bool,
 
-    /// Test filter patterns to include (glob syntax).
-    /// If empty/absent, all tests are included.
-    /// Examples: `("tests::unit::*" "my_crate::*")`
+    /// Nextest filter expression (passed directly to -E).
+    /// See https://nexte.st/docs/filtersets/ for syntax.
+    /// Example: `"not test(slow_) and not test(integration)"`
     #[facet(default)]
-    pub include: Option<Vec<String>>,
-
-    /// Test filter patterns to exclude (glob syntax).
-    /// Examples: `("tests::integration::*" "*::slow_*")`
-    #[facet(default)]
-    pub exclude: Option<Vec<String>>,
+    pub filter: Option<String>,
 
     /// Debounce delay in milliseconds after file save before running tests.
     /// Prevents rapid re-runs during burst saves.

@@ -171,12 +171,10 @@ pub async fn run_tests_verbose(
         args.push(target_dir.display().to_string());
     }
 
-    // Add filter expressions if configured
-    let include = config.include.as_deref().unwrap_or_default();
-    let filter = build_filter_expression(include, &config.exclude);
-    if !filter.is_empty() {
+    // Add filter expression if configured
+    if let Some(ref filter) = config.filter {
         args.push("-E".to_string());
-        args.push(filter);
+        args.push(filter.clone());
     }
 
     let command_str = format!("cargo {}", args.join(" "));
@@ -490,94 +488,5 @@ pub async fn run_tests_verbose(
             "No JSON output but process succeeded"
         );
         RunOutcome::Tests(test_result, stats)
-    }
-}
-
-/// Build a nextest filter expression from include/exclude patterns.
-///
-/// Nextest filter syntax: https://nexte.st/docs/filtersets
-/// - `test(pattern)` matches test names
-/// - `&` for AND, `|` for OR, `!` for NOT
-fn build_filter_expression(include: &[String], exclude: &Option<Vec<String>>) -> String {
-    let mut parts = Vec::new();
-
-    // Include patterns (OR together)
-    if !include.is_empty() {
-        let include_expr: Vec<String> = include
-            .iter()
-            .map(|p| format!("test({})", glob_to_regex(p)))
-            .collect();
-        parts.push(format!("({})", include_expr.join(" | ")));
-    }
-
-    // Exclude patterns (AND NOT each one)
-    if let Some(exclude) = exclude {
-        for pattern in exclude {
-            parts.push(format!("!test({})", glob_to_regex(pattern)));
-        }
-    }
-
-    if parts.is_empty() {
-        String::new()
-    } else {
-        parts.join(" & ")
-    }
-}
-
-/// Convert a glob pattern to a regex pattern for nextest.
-///
-/// Basic conversion:
-/// - `*` -> `.*` (match anything)
-/// - `?` -> `.` (match single char)
-/// - Escape regex metacharacters
-fn glob_to_regex(glob: &str) -> String {
-    let mut regex = String::with_capacity(glob.len() * 2);
-    regex.push('/'); // nextest patterns are regex, wrap in slashes
-
-    for c in glob.chars() {
-        match c {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
-                regex.push('\\');
-                regex.push(c);
-            }
-            _ => regex.push(c),
-        }
-    }
-
-    regex.push('/');
-    regex
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_glob_to_regex() {
-        assert_eq!(glob_to_regex("tests::*"), "/tests::.*/");
-        assert_eq!(glob_to_regex("*::slow_*"), "/.*::slow_.*/");
-        assert_eq!(glob_to_regex("exact::name"), "/exact::name/");
-        assert_eq!(glob_to_regex("foo.bar"), "/foo\\.bar/");
-    }
-
-    #[test]
-    fn test_build_filter_expression() {
-        // Include only
-        let include = vec!["tests::unit::*".to_string()];
-        let expr = build_filter_expression(&include, &None);
-        assert_eq!(expr, "(test(/tests::unit::.*/))");
-
-        // Include multiple
-        let include = vec!["tests::unit::*".to_string(), "my_crate::*".to_string()];
-        let expr = build_filter_expression(&include, &None);
-        assert_eq!(expr, "(test(/tests::unit::.*/) | test(/my_crate::.*/))");
-
-        // Include + exclude
-        let include = vec!["*".to_string()];
-        let exclude = Some(vec!["*::slow_*".to_string()]);
-        let expr = build_filter_expression(&include, &exclude);
-        assert_eq!(expr, "(test(/.*/)) & !test(/.*::slow_.*/)");
     }
 }
