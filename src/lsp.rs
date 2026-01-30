@@ -1,7 +1,7 @@
 //! LSP server implementation using tower-lsp.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, mpsc};
@@ -209,12 +209,28 @@ impl Backend {
                 Ok(mut watcher) => {
                     let test_trigger = self.test_trigger.clone();
                     let client = self.client.clone();
+                    let state = self.state.clone();
 
                     // Spawn task to handle watcher events
                     tokio::spawn(async move {
                         while let Some(event) = watcher.rx.recv().await {
                             match event {
                                 WatcherEvent::FileSaved(path) => {
+                                    // Check if this is the config file
+                                    if path.ends_with(".config/squiggles/config.styx") {
+                                        Self::reload_config(&state, &client, &path).await;
+                                        continue;
+                                    }
+
+                                    // Check if enabled before triggering test run
+                                    let enabled = {
+                                        let state = state.read().await;
+                                        state.config.enabled
+                                    };
+                                    if !enabled {
+                                        continue;
+                                    }
+
                                     client
                                         .log_message(
                                             MessageType::INFO,
@@ -253,6 +269,55 @@ impl Backend {
 
         // Trigger initial test run
         let _ = self.test_trigger.send(()).await;
+    }
+
+    /// Reload config from disk and update state.
+    async fn reload_config(state: &Arc<RwLock<ServerState>>, client: &Client, config_path: &Path) {
+        let content = match tokio::fs::read_to_string(config_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("squiggles: failed to read config: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let config: crate::config::Config = match facet_styx::from_str(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("squiggles: failed to parse config: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        let was_enabled = {
+            let state = state.read().await;
+            state.config.enabled
+        };
+
+        {
+            let mut state = state.write().await;
+            state.config = config.clone();
+        }
+
+        client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "squiggles: config reloaded (enabled: {} -> {})",
+                    was_enabled, config.enabled
+                ),
+            )
+            .await;
     }
 
     /// Watch for config file to be created, then start up.
