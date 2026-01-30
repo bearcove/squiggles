@@ -1475,6 +1475,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "facet",
+ "facet-styx",
 ]
 
 [[package]]

@@ -557,6 +557,12 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let state = self.state.read().await;
+        if !state.config.enabled {
+            return;
+        }
+        drop(state);
+
         let uri = params.text_document.uri;
         self.client
             .log_message(MessageType::INFO, format!("File saved: {uri}"))
@@ -724,11 +730,16 @@ impl LanguageServer for Backend {
                             // Wavy vertical border characters
                             let wavy = ["│", "╎", "┊", "╏", "┆"];
 
-                            // Format the message with proper indentation and wavy left border
+                            // Wrap lines at 80 characters (accounting for indent + border + spacing)
+                            const MAX_WIDTH: usize = 80;
+                            let content_width = MAX_WIDTH.saturating_sub(indent.len() + 3); // 3 for "│  "
+
+                            // Format the message with proper indentation, wrapping, and wavy left border
                             let formatted_lines: Vec<String> = stored
                                 .failure
                                 .message
                                 .lines()
+                                .flat_map(|line| wrap_line(line, content_width))
                                 .enumerate()
                                 .map(|(i, line)| {
                                     let border = wavy[i % wavy.len()];
@@ -736,16 +747,8 @@ impl LanguageServer for Backend {
                                 })
                                 .collect();
 
-                            // Find the longest line to size the waves
-                            let max_len = formatted_lines
-                                .iter()
-                                .map(|l| l.chars().count())
-                                .max()
-                                .unwrap_or(40)
-                                .max(50); // minimum width
-
-                            // Calculate line length for box drawing
-                            let wave_len = max_len.saturating_sub(indent.len() + 6);
+                            // Box width is fixed at 80 chars
+                            let wave_len = MAX_WIDTH.saturating_sub(indent.len() + 6);
 
                             // Build the full hint with box drawing top/bottom
                             let hint_text = format!(
@@ -1530,7 +1533,7 @@ fn format_failure_hover(
 /// Extract the message from color-backtrace format output.
 ///
 /// Color-backtrace outputs:
-/// ```
+/// ```text
 /// The application panicked (crashed).
 /// Message:  {message}
 ///   {optional extra lines for assertion failures}
@@ -1554,6 +1557,53 @@ fn extract_color_backtrace_message(output: &str) -> Option<String> {
     } else {
         Some(message.to_string())
     }
+}
+
+/// Wrap a line at the specified width, breaking at word boundaries where possible.
+fn wrap_line(line: &str, max_width: usize) -> Vec<String> {
+    if line.chars().count() <= max_width {
+        return vec![line.to_string()];
+    }
+
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+
+    for word in line.split_inclusive(char::is_whitespace) {
+        let word_width = word.chars().count();
+
+        if current_width + word_width > max_width && !current_line.is_empty() {
+            result.push(current_line.trim_end().to_string());
+            current_line = String::new();
+            current_width = 0;
+        }
+
+        // Handle words longer than max_width by hard-breaking them
+        if word_width > max_width {
+            let mut chars = word.chars().peekable();
+            while chars.peek().is_some() {
+                let remaining = max_width - current_width;
+                let chunk: String = chars.by_ref().take(remaining).collect();
+                current_line.push_str(&chunk);
+                current_width += chunk.chars().count();
+
+                if current_width >= max_width {
+                    result.push(current_line.trim_end().to_string());
+                    current_line = String::new();
+                    current_width = 0;
+                }
+            }
+        } else {
+            current_line.push_str(word);
+            current_width += word_width;
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push(current_line.trim_end().to_string());
+    }
+
+    result
 }
 
 /// Resolve a file path relative to the workspace root.
@@ -1997,6 +2047,41 @@ fn test_with_parens() {}
 
             let hover = format_failure_hover(&failure, None, None);
             assert!(hover.contains("custom error from color-backtrace"));
+        }
+    }
+
+    mod wrap_line_tests {
+        use super::super::wrap_line;
+
+        #[test]
+        fn short_line_unchanged() {
+            assert_eq!(wrap_line("hello world", 80), vec!["hello world"]);
+        }
+
+        #[test]
+        fn wraps_at_word_boundary() {
+            assert_eq!(
+                wrap_line("hello world foo bar", 12),
+                vec!["hello world", "foo bar"]
+            );
+        }
+
+        #[test]
+        fn hard_breaks_long_words() {
+            assert_eq!(
+                wrap_line("abcdefghijklmnop", 8),
+                vec!["abcdefgh", "ijklmnop"]
+            );
+        }
+
+        #[test]
+        fn empty_line() {
+            assert_eq!(wrap_line("", 80), vec![""]);
+        }
+
+        #[test]
+        fn exact_width() {
+            assert_eq!(wrap_line("12345678", 8), vec!["12345678"]);
         }
     }
 }

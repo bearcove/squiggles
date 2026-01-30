@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 facet = { git = "https://github.com/facet-rs/facet", branch = "main", features = ["alloc"] }
 dirs = "6.0.0"
+
+[dev-dependencies]
+facet-styx = { git = "https://github.com/bearcove/styx", branch = "main" }

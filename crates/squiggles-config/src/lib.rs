@@ -56,3 +56,27 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_config_defaults_to_disabled() {
+        // Styx config files are just key-value pairs at the top level
+        let config: Config = facet_styx::from_str("").unwrap();
+        assert!(!config.enabled, "enabled should default to false");
+    }
+
+    #[test]
+    fn test_enabled_true() {
+        let config: Config = facet_styx::from_str("enabled true").unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_enabled_false() {
+        let config: Config = facet_styx::from_str("enabled false").unwrap();
+        assert!(!config.enabled);
+    }
+}
