@@ -309,5 +309,8 @@ edition = "2021"
         RunOutcome::ProcessFailed(msg) => {
             panic!("Process failed unexpectedly: {msg}");
         }
+        RunOutcome::Cancelled => {
+            panic!("Run was cancelled unexpectedly");
+        }
     }
 }

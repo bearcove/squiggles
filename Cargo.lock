@@ -1464,6 +1464,7 @@ dependencies = [
  "styx-embed",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-lsp",
  "tracing",

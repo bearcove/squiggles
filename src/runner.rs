@@ -7,6 +7,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -68,6 +69,8 @@ pub enum RunOutcome {
     BuildFailed(String, RunStats),
     /// Process failed to start or crashed.
     ProcessFailed(String),
+    /// Run was cancelled before completion.
+    Cancelled,
 }
 
 /// A log event emitted during a test run.
@@ -144,16 +147,18 @@ fn parse_build_progress(line: &str) -> Option<BuildProgress> {
 /// This function reads both stdout and stderr concurrently, so it won't hang
 /// even if the build fails and produces no JSON output.
 pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
-    run_tests_verbose(workspace_root, config, None).await
+    run_tests_verbose(workspace_root, config, None, CancellationToken::new()).await
 }
 
 /// Run tests with verbose logging via a channel.
 ///
 /// If `log_tx` is provided, log events will be sent as they happen.
+/// If `cancel` is triggered, the test process will be killed.
 pub async fn run_tests_verbose(
     workspace_root: &Path,
     config: &Config,
     log_tx: Option<mpsc::Sender<RunLogEvent>>,
+    cancel: CancellationToken,
 ) -> RunOutcome {
     let start_time = Instant::now();
 
@@ -384,8 +389,20 @@ pub async fn run_tests_verbose(
         (stderr_output, stderr_lines)
     });
 
-    // Wait for both to complete
-    let (stdout_result, stderr_result) = tokio::join!(stdout_handle, stderr_handle);
+    // Wait for both to complete, or cancellation
+    let work = async { tokio::join!(stdout_handle, stderr_handle) };
+
+    tokio::select! {
+        biased;
+
+        _ = cancel.cancelled() => {
+            // Kill the child process
+            info!("Test run cancelled, killing child process");
+            let _ = child.kill().await;
+            return RunOutcome::Cancelled;
+        }
+
+        (stdout_result, stderr_result) = work => {
 
     let (test_result, got_json, stdout_lines, json_lines) = stdout_result.unwrap_or_else(|e| {
         warn!(error = %e, "stdout task panicked");
@@ -489,4 +506,7 @@ pub async fn run_tests_verbose(
         );
         RunOutcome::Tests(test_result, stats)
     }
+
+        } // end of work => { ... } arm
+    } // end of select!
 }

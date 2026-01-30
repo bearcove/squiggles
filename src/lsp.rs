@@ -313,8 +313,8 @@ impl Backend {
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "squiggles: config reloaded (enabled: {} -> {})",
-                    was_enabled, config.enabled
+                    "squiggles: config reloaded (enabled: {} -> {}, filter: {:?})",
+                    was_enabled, config.enabled, config.filter
                 ),
             )
             .await;
@@ -1093,10 +1093,17 @@ async fn test_runner_loop(
 ) {
     use crate::diagnostics::{TestFunctionIndex, extract_test_name, failures_to_diagnostics};
     use crate::runner::{RunLogEvent, RunOutcome, run_tests_verbose};
+    use tokio_util::sync::CancellationToken;
+
+    // Token to cancel the current test run
+    let mut current_cancel: Option<CancellationToken> = None;
 
     while rx.recv().await.is_some() {
-        // Coalesce multiple rapid triggers into one run
-        // Drain any pending triggers
+        // Cancel any running test
+        if let Some(cancel) = current_cancel.take() {
+            cancel.cancel();
+        }
+        // Drain any pending triggers (debounce)
         while rx.try_recv().is_ok() {}
 
         // Get workspace root and config
@@ -1227,8 +1234,12 @@ async fn test_runner_loop(
             }
         });
 
+        // Create cancellation token for this run
+        let cancel = CancellationToken::new();
+        current_cancel = Some(cancel.clone());
+
         // Run tests - this always completes, never hangs
-        let outcome = run_tests_verbose(&workspace_root, &config, Some(log_tx)).await;
+        let outcome = run_tests_verbose(&workspace_root, &config, Some(log_tx), cancel).await;
 
         // Wait for log task to finish
         let _ = log_task.await;
@@ -1388,6 +1399,11 @@ async fn test_runner_loop(
                 }
 
                 progress.end(Some(summary)).await;
+            }
+            RunOutcome::Cancelled => {
+                // Test run was cancelled (new run starting)
+                // Don't clear diagnostics - they'll be updated by the new run
+                progress.end(Some("Cancelled".to_string())).await;
             }
         }
     }

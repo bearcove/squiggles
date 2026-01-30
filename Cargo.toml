@@ -21,6 +21,7 @@ facet-styx = { git = "https://github.com/bearcove/styx", branch = "main", featur
 
 # Async runtime (tower-lsp is built on tokio)
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 # Logging
 tracing = "0.1"
