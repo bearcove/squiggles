@@ -172,14 +172,11 @@ pub async fn run_tests_verbose(
     }
 
     // Add filter expressions if configured
-    if let Some(ref include) = config.include
-        && !include.is_empty()
-    {
-        let filter = build_filter_expression(include, &config.exclude);
-        if !filter.is_empty() {
-            args.push("-E".to_string());
-            args.push(filter);
-        }
+    let include = config.include.as_deref().unwrap_or_default();
+    let filter = build_filter_expression(include, &config.exclude);
+    if !filter.is_empty() {
+        args.push("-E".to_string());
+        args.push(filter);
     }
 
     let command_str = format!("cargo {}", args.join(" "));

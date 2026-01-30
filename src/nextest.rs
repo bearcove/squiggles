@@ -198,8 +198,9 @@ fn parse_panic_header(stdout: &str) -> (String, Option<SourceLocation>) {
                 .get(message_start..)
                 .map(|s| s.trim_start_matches('\n'))
                 .and_then(|s| s.lines().next())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
+            // Strip ANSI codes from the message
+            let message = strip_ansi_codes(message);
 
             return (message, location);
         }
