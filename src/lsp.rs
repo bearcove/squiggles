@@ -1132,10 +1132,16 @@ async fn test_runner_loop(
         let (log_tx, mut log_rx) = mpsc::channel::<RunLogEvent>(4096);
         let log_client = client.clone();
         let log_progress = Arc::clone(&progress);
+        let log_state = Arc::clone(&state);
+        let log_workspace_root = workspace_root.clone();
+        let scan_exclude: Vec<String> = config.scan_exclude.clone().unwrap_or_default();
 
         // Track test progress
         let mut tests_completed = 0u32;
         let mut tests_total = 0u32;
+
+        // Build test function index once at the start for incremental updates
+        let test_index = TestFunctionIndex::build_with_excludes(&log_workspace_root, &scan_exclude);
 
         // Spawn a task to forward log events to the LSP client and update progress
         let log_task = tokio::spawn(async move {
@@ -1213,6 +1219,60 @@ async fn test_runner_loop(
                                 }
                             };
                             log_progress.report(msg).await;
+                        }
+                    }
+                    RunLogEvent::TestPassed { name } => {
+                        // Check if this test previously failed - if so, clear its diagnostic
+                        let short_name = extract_test_name(&name);
+                        if let Some(test_loc) = test_index.get(&short_name) {
+                            let uri = Some(test_loc.uri.clone());
+
+                            let mut state_guard = log_state.write().await;
+                            // Check if it was previously failed
+                            if let Some(TestResult::Failed(_)) = state_guard.test_results.get(&name)
+                            {
+                                // Update to passed
+                                state_guard
+                                    .test_results
+                                    .insert(name.clone(), TestResult::Passed);
+
+                                // Rebuild diagnostics for this file
+                                if let Some(uri) = uri {
+                                    let diagnostics =
+                                        rebuild_diagnostics_for_file(&state_guard, &uri);
+                                    drop(state_guard);
+                                    log_client.publish_diagnostics(uri, diagnostics, None).await;
+                                }
+                            } else {
+                                // Just mark as passed
+                                state_guard
+                                    .test_results
+                                    .insert(name.clone(), TestResult::Passed);
+                            }
+                        }
+                    }
+                    RunLogEvent::TestFailed { failure } => {
+                        // Immediately publish diagnostic for this failure
+                        let short_name = extract_test_name(&failure.name);
+                        if let Some(test_loc) = test_index.get(&short_name) {
+                            let uri = Some(test_loc.uri.clone());
+
+                            let mut state_guard = log_state.write().await;
+                            // Store the failure
+                            state_guard.test_results.insert(
+                                failure.name.clone(),
+                                TestResult::Failed(StoredFailure {
+                                    failure: failure.clone(),
+                                    range: test_loc.name_span.to_range(),
+                                }),
+                            );
+
+                            // Rebuild diagnostics for this file
+                            if let Some(uri) = uri {
+                                let diagnostics = rebuild_diagnostics_for_file(&state_guard, &uri);
+                                drop(state_guard);
+                                log_client.publish_diagnostics(uri, diagnostics, None).await;
+                            }
                         }
                     }
                     RunLogEvent::Completed { stats } => {
@@ -1407,6 +1467,31 @@ async fn test_runner_loop(
             }
         }
     }
+}
+
+/// Rebuild all diagnostics for a single file based on current state.
+///
+/// This is used for incremental updates when test results stream in.
+fn rebuild_diagnostics_for_file(state: &ServerState, uri: &Url) -> Vec<Diagnostic> {
+    use crate::diagnostics::extract_failure_summary;
+
+    let mut diagnostics = Vec::new();
+
+    // Check the failures map which is keyed by URI string
+    if let Some(failures) = state.failures.get(&uri.to_string()) {
+        for stored in failures {
+            let message = extract_failure_summary(&stored.failure.full_output);
+            diagnostics.push(Diagnostic {
+                range: stored.range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("squiggles".to_string()),
+                message,
+                ..Default::default()
+            });
+        }
+    }
+
+    diagnostics
 }
 
 /// Format a test failure for hover display.

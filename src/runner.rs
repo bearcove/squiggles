@@ -88,6 +88,10 @@ pub enum RunLogEvent {
         line: String,
         progress: Option<BuildProgress>,
     },
+    /// A test passed.
+    TestPassed { name: String },
+    /// A test failed with full failure details.
+    TestFailed { failure: TestFailure },
     /// The run completed.
     Completed { stats: RunStats },
 }
@@ -298,6 +302,12 @@ pub async fn run_tests_verbose(
                         NextestMessage::Test(test_event) => match test_event {
                             nextest::TestEvent::Ok { name, .. } => {
                                 passed_tests.push(name.clone());
+                                // Send test passed event
+                                if let Some(ref tx) = stdout_log_tx {
+                                    let _ = tx
+                                        .send(RunLogEvent::TestPassed { name: name.clone() })
+                                        .await;
+                                }
                                 format!("test:ok {name}")
                             }
                             nextest::TestEvent::Failed { name, stdout, .. } => {
@@ -307,6 +317,14 @@ pub async fn run_tests_verbose(
                                     } else {
                                         " (no panic location found)".to_string()
                                     };
+                                    // Send test failed event
+                                    if let Some(ref tx) = stdout_log_tx {
+                                        let _ = tx
+                                            .send(RunLogEvent::TestFailed {
+                                                failure: failure.clone(),
+                                            })
+                                            .await;
+                                    }
                                     failures.push(failure);
                                     format!("test:failed {name}{loc_info}")
                                 } else {

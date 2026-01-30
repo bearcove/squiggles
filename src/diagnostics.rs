@@ -375,7 +375,7 @@ pub fn extract_test_name(full_name: &str) -> String {
 ///
 /// Looks for common patterns in test output like assertion failures,
 /// "left/right" comparisons, etc.
-fn extract_failure_summary(output: &str) -> String {
+pub fn extract_failure_summary(output: &str) -> String {
     // Look for "assertion `left == right` failed" pattern
     if let Some(idx) = output.find("assertion `")
         && let Some(end) = output[idx..].find("` failed")
