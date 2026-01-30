@@ -437,7 +437,7 @@ pub async fn run_tests_verbose(
             // Kill the child process
             info!("Test run cancelled, killing child process");
             let _ = child.kill().await;
-            return RunOutcome::Cancelled;
+            RunOutcome::Cancelled
         }
 
         (stdout_result, stderr_result) = work => {

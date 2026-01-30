@@ -1569,16 +1569,15 @@ fn format_failure_hover(
         // Try using workspace metadata to resolve via crate name
         if let Some(meta) = workspace_metadata
             && let Some(func) = function
+            && let Some(resolved) = meta.resolve_frame_path(func, file)
         {
-            if let Some(resolved) = meta.resolve_frame_path(func, file) {
-                crate::diagnostics::debug_log(&format!(
-                    "resolve_path: '{}' via function '{}' -> {}",
-                    file,
-                    func,
-                    resolved.display()
-                ));
-                return Some(resolved);
-            }
+            crate::diagnostics::debug_log(&format!(
+                "resolve_path: '{}' via function '{}' -> {}",
+                file,
+                func,
+                resolved.display()
+            ));
+            return Some(resolved);
         }
 
         // Fall back to workspace root join
