@@ -84,8 +84,8 @@ async fn debounce_loop(
                     Some(Ok(ev)) => {
                         if let Some(paths) = extract_saved_paths(&ev) {
                             for path in paths {
-                                // Only watch Rust files
-                                if is_rust_file(&path) {
+                                // Watch Rust files and the squiggles config file
+                                if is_rust_file(&path) || is_config_file(&path) {
                                     pending_files.insert(path);
                                 }
                             }
@@ -140,6 +140,11 @@ fn is_rust_file(path: &Path) -> bool {
     path.extension().map(|ext| ext == "rs").unwrap_or(false)
 }
 
+/// Check if a path is the squiggles config file.
+fn is_config_file(path: &Path) -> bool {
+    path.ends_with(".config/squiggles/config.styx")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +156,16 @@ mod tests {
         assert!(!is_rust_file(Path::new("Cargo.toml")));
         assert!(!is_rust_file(Path::new("README.md")));
         assert!(!is_rust_file(Path::new("no_extension")));
+    }
+
+    #[test]
+    fn test_is_config_file() {
+        assert!(is_config_file(Path::new(
+            "/home/user/project/.config/squiggles/config.styx"
+        )));
+        assert!(is_config_file(Path::new(".config/squiggles/config.styx")));
+        assert!(!is_config_file(Path::new("config.styx")));
+        assert!(!is_config_file(Path::new(".config/other/config.styx")));
+        assert!(!is_config_file(Path::new("src/main.rs")));
     }
 }
