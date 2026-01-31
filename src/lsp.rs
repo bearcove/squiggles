@@ -1106,7 +1106,7 @@ async fn test_runner_loop(
     client: Client,
 ) {
     use crate::diagnostics::{TestFunctionIndex, extract_test_name, failures_to_diagnostics};
-    use crate::runner::{RunLogEvent, RunOutcome, run_tests_verbose};
+    use crate::runner::{RunLogEvent, RunOutcome, run_package_tests, run_tests_verbose};
     use tokio_util::sync::CancellationToken;
 
     // Token to cancel the current test run
@@ -1146,14 +1146,51 @@ async fn test_runner_loop(
             }
         };
 
-        // Determine which package to test based on the saved file
-        let package_filter: Option<String> = saved_file.as_ref().and_then(|path| {
+        // Determine which package the saved file belongs to
+        let detected_package: Option<String> = saved_file.as_ref().and_then(|path| {
             workspace_metadata
                 .as_ref()
                 .and_then(|meta| meta.package_for_file(path))
         });
 
-        if let Some(ref pkg) = package_filter {
+        // Check if we're in package mode and have a config for this package
+        let package_mode_config = if config.is_package_mode() {
+            detected_package.as_ref().and_then(|pkg| {
+                config
+                    .package_config(pkg)
+                    .map(|tc| (pkg.clone(), tc.clone()))
+            })
+        } else {
+            None
+        };
+
+        // Log what we're about to do
+        if let Some((ref pkg, _)) = package_mode_config {
+            client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Running tests for configured package: {pkg}"),
+                )
+                .await;
+        } else if config.is_package_mode() {
+            // In package mode but file doesn't belong to a configured package
+            if let Some(ref pkg) = detected_package {
+                client
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Skipping: package {pkg} is not configured in squiggles config"),
+                    )
+                    .await;
+            } else {
+                client
+                    .log_message(
+                        MessageType::INFO,
+                        "Skipping: file doesn't belong to any configured package",
+                    )
+                    .await;
+            }
+            continue;
+        } else if let Some(ref pkg) = detected_package {
             client
                 .log_message(
                     MessageType::INFO,
@@ -1337,15 +1374,29 @@ async fn test_runner_loop(
         let cancel = CancellationToken::new();
         current_cancel = Some(cancel.clone());
 
-        // Run tests - this always completes, never hangs
-        let outcome = run_tests_verbose(
-            &workspace_root,
-            &config,
-            Some(log_tx),
-            cancel,
-            package_filter.as_deref(),
-        )
-        .await;
+        // Run tests - either package-specific or workspace-wide
+        let outcome = if let Some((ref pkg, ref test_config)) = package_mode_config {
+            // Package mode: run tests for this specific package with its config
+            run_package_tests(
+                &workspace_root,
+                &config,
+                pkg,
+                test_config,
+                Some(log_tx),
+                cancel,
+            )
+            .await
+        } else {
+            // Workspace mode: run tests with optional package filter for rdeps
+            run_tests_verbose(
+                &workspace_root,
+                &config,
+                Some(log_tx),
+                cancel,
+                detected_package.as_deref(),
+            )
+            .await
+        };
 
         // Wait for log task to finish
         let _ = log_task.await;
