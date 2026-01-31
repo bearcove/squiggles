@@ -155,49 +155,48 @@ impl TestResultStore {
             };
 
             // Primary diagnostic at test function
-            if let Some(ref loc) = entry.test_location {
-                if &loc.uri == uri {
-                    let message = if !failure.message.is_empty() {
-                        failure
-                            .message
-                            .lines()
-                            .next()
-                            .unwrap_or("Test failed")
-                            .to_string()
-                    } else {
-                        extract_failure_summary(&failure.full_output)
-                    };
+            if let Some(ref loc) = entry.test_location
+                && &loc.uri == uri
+            {
+                let message = if !failure.message.is_empty() {
+                    failure
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or("Test failed")
+                        .to_string()
+                } else {
+                    extract_failure_summary(&failure.full_output)
+                };
 
-                    diagnostics.push(Diagnostic {
-                        range: loc.name_span.to_range(),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        code: None,
-                        code_description: None,
-                        source: Some("squiggles".to_string()),
-                        message,
-                        related_information: None,
-                        tags: None,
-                        data: None,
-                    });
-                }
+                diagnostics.push(Diagnostic {
+                    range: loc.name_span.to_range(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: None,
+                    code_description: None,
+                    source: Some("squiggles".to_string()),
+                    message,
+                    related_information: None,
+                    tags: None,
+                    data: None,
+                });
             }
 
             // Collect panic location for deduplication
-            if let Some(ref panic_loc) = failure.panic_location {
-                if let Some(panic_uri) = self.resolve_panic_uri(panic_loc) {
-                    if &panic_uri == uri {
-                        // Check it's not the same location as the test function
-                        let is_same_location = entry.test_location.as_ref().is_some_and(|loc| {
-                            loc.uri == panic_uri && loc.name_span.line + 1 == panic_loc.line
-                        });
+            if let Some(ref panic_loc) = failure.panic_location
+                && let Some(panic_uri) = self.resolve_panic_uri(panic_loc)
+                && &panic_uri == uri
+            {
+                // Check it's not the same location as the test function
+                let is_same_location = entry.test_location.as_ref().is_some_and(|loc| {
+                    loc.uri == panic_uri && loc.name_span.line + 1 == panic_loc.line
+                });
 
-                        if !is_same_location {
-                            panic_locations
-                                .entry(panic_loc.line)
-                                .or_default()
-                                .push(entry.short_name.clone());
-                        }
-                    }
+                if !is_same_location {
+                    panic_locations
+                        .entry(panic_loc.line)
+                        .or_default()
+                        .push(entry.short_name.clone());
                 }
             }
         }
@@ -251,21 +250,21 @@ impl TestResultStore {
             };
 
             // Check test function location (name span)
-            if let Some(ref loc) = entry.test_location {
-                if &loc.uri == uri && contains_position(&loc.name_span.to_range(), position) {
-                    return Some(failure);
-                }
+            if let Some(ref loc) = entry.test_location
+                && &loc.uri == uri
+                && contains_position(&loc.name_span.to_range(), position)
+            {
+                return Some(failure);
             }
 
             // Check panic location
-            if let Some(ref panic_loc) = failure.panic_location {
-                if let Some(panic_uri) = self.resolve_panic_uri(panic_loc) {
-                    if &panic_uri == uri {
-                        let panic_range = location_to_range(panic_loc);
-                        if contains_position(&panic_range, position) {
-                            return Some(failure);
-                        }
-                    }
+            if let Some(ref panic_loc) = failure.panic_location
+                && let Some(panic_uri) = self.resolve_panic_uri(panic_loc)
+                && &panic_uri == uri
+            {
+                let panic_range = location_to_range(panic_loc);
+                if contains_position(&panic_range, position) {
+                    return Some(failure);
                 }
             }
         }

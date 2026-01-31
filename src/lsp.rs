@@ -569,20 +569,20 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         let state = self.state.read().await;
-        if let Some(ref store) = state.test_store {
-            if let Some(failure) = store.failure_at_position(&uri, position) {
-                let workspace_root = state.workspace_root.as_deref();
-                let workspace_metadata = state.workspace_metadata.as_ref();
-                let content = format_failure_hover(failure, workspace_root, workspace_metadata);
+        if let Some(ref store) = state.test_store
+            && let Some(failure) = store.failure_at_position(&uri, position)
+        {
+            let workspace_root = state.workspace_root.as_deref();
+            let workspace_metadata = state.workspace_metadata.as_ref();
+            let content = format_failure_hover(failure, workspace_root, workspace_metadata);
 
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: content,
-                    }),
-                    range: None,
-                }));
-            }
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: content,
+                }),
+                range: None,
+            }));
         }
 
         Ok(None)

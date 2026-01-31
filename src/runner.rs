@@ -225,14 +225,14 @@ async fn run_tests_with_config(
     }
 
     // Add features from test config
-    if let Some(ref tc) = test_config {
+    if let Some(tc) = test_config {
         if tc.all_features {
             args.push("--all-features".to_string());
-        } else if let Some(ref features) = tc.features {
-            if !features.is_empty() {
-                args.push("--features".to_string());
-                args.push(features.join(","));
-            }
+        } else if let Some(ref features) = tc.features
+            && !features.is_empty()
+        {
+            args.push("--features".to_string());
+            args.push(features.join(","));
         }
     }
 
@@ -243,11 +243,11 @@ async fn run_tests_with_config(
     }
 
     // Add user's filter expression from test config
-    if let Some(ref tc) = test_config {
-        if let Some(ref filter) = tc.filter {
-            args.push("-E".to_string());
-            args.push(filter.clone());
-        }
+    if let Some(tc) = test_config
+        && let Some(ref filter) = tc.filter
+    {
+        args.push("-E".to_string());
+        args.push(filter.clone());
     }
 
     let command_str = format!("cargo {}", args.join(" "));
@@ -278,11 +278,11 @@ async fn run_tests_with_config(
         .stderr(Stdio::piped());
 
     // Add environment variables from test config
-    if let Some(ref tc) = test_config {
-        if let Some(ref env) = tc.env {
-            for (key, value) in env {
-                cmd.env(key, value);
-            }
+    if let Some(tc) = test_config
+        && let Some(ref env) = tc.env
+    {
+        for (key, value) in env {
+            cmd.env(key, value);
         }
     }
 
