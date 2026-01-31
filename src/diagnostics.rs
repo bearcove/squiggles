@@ -49,6 +49,7 @@ pub struct TestLocation {
 /// Index of test function locations in the workspace.
 ///
 /// Maps short test name (e.g., "test_something") to its location.
+#[derive(Debug, Clone)]
 pub struct TestFunctionIndex {
     by_name: HashMap<String, TestLocation>,
 }

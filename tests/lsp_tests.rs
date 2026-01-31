@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::*;
 
 use squiggles::diagnostics::{TestFunctionIndex, extract_test_name};
-use squiggles::lsp::{StoredFailure, find_test_functions_detailed};
+use squiggles::lsp::find_test_functions_detailed;
 use squiggles::nextest::{NextestMessage, parse_message};
 
 // Test that stale diagnostics tracking works correctly
@@ -188,14 +188,11 @@ fn test_failure_stored_at_function_name_for_hover() {
     assert!(test_info.name_span.len > 0, "name span should have length");
 
     // When storing for hover, we store at the function name location
-    let stored = StoredFailure {
-        failure: failure.clone(),
-        range: test_info.name_span.to_range(),
-    };
+    let range = test_info.name_span.to_range();
 
     // Verify the range is on the correct line
-    assert_eq!(stored.range.start.line, 226);
-    assert_eq!(stored.range.end.line, 226);
+    assert_eq!(range.start.line, 226);
+    assert_eq!(range.end.line, 226);
 
     // Simulate hover lookup: position on the function name should find the failure
     let hover_position = Position {
@@ -217,12 +214,15 @@ fn test_failure_stored_at_function_name_for_hover() {
     }
 
     assert!(
-        contains_position(&stored.range, hover_position),
+        contains_position(&range, hover_position),
         "hover on function name (line {}, char {}) should find failure stored at {:?}",
         hover_position.line,
         hover_position.character,
-        stored.range
+        range
     );
+
+    // Also verify the failure was parsed correctly
+    assert!(!failure.message.is_empty(), "failure should have a message");
 }
 
 /// Test that the test index correctly finds test functions by short name.

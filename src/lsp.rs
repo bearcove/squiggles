@@ -1,6 +1,5 @@
 //! LSP server implementation using tower-lsp.
 
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,52 +14,6 @@ use crate::nextest::TestFailure;
 use crate::progress::ProgressHandle;
 use crate::watcher::{FileWatcher, WatcherEvent};
 
-/// A stored failure for hover lookup.
-#[derive(Debug, Clone)]
-pub struct StoredFailure {
-    /// The test failure data.
-    pub failure: TestFailure,
-    /// The range in the file where the diagnostic appears.
-    pub range: Range,
-}
-
-impl StoredFailure {
-    /// Build an LSP Diagnostic from this stored failure.
-    pub fn to_diagnostic(&self) -> Diagnostic {
-        let message = if !self.failure.message.is_empty() {
-            self.failure
-                .message
-                .lines()
-                .next()
-                .unwrap_or("Test failed")
-                .to_string()
-        } else {
-            "Test failed".to_string()
-        };
-
-        Diagnostic {
-            range: self.range,
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: None,
-            code_description: None,
-            source: Some("squiggles".to_string()),
-            message,
-            related_information: None,
-            tags: None,
-            data: None,
-        }
-    }
-}
-
-/// Result of a single test (pass or fail).
-#[derive(Debug, Clone)]
-pub enum TestResult {
-    /// Test passed.
-    Passed,
-    /// Test failed with details.
-    Failed(StoredFailure),
-}
-
 /// Shared state for the LSP server.
 pub struct ServerState {
     /// Configuration loaded at startup.
@@ -69,68 +22,9 @@ pub struct ServerState {
     pub workspace_root: Option<PathBuf>,
     /// Cargo workspace metadata for resolving crate-relative paths.
     pub workspace_metadata: Option<WorkspaceMetadata>,
-    /// Test failures indexed by file URI for hover lookup.
-    /// Maps URI string -> list of failures in that file.
-    pub failures: HashMap<String, Vec<StoredFailure>>,
-    /// URIs that currently have published diagnostics.
-    /// Used to clear stale diagnostics when tests pass.
-    pub files_with_diagnostics: HashSet<String>,
-    /// All test results indexed by full test name (e.g., "crate::module::test_name").
-    /// Used for inlay hints.
-    pub test_results: HashMap<String, TestResult>,
-}
-
-impl ServerState {
-    /// Store failures for hover lookup.
-    /// Returns URIs that previously had diagnostics but no longer do (need clearing).
-    pub fn store_failures(&mut self, failures: Vec<(Url, StoredFailure)>) -> Vec<Url> {
-        // Track which files have failures now
-        let mut new_files: HashSet<String> = HashSet::new();
-
-        // Clear old failures
-        self.failures.clear();
-
-        // Index by file
-        for (uri, failure) in failures {
-            let uri_str = uri.to_string();
-            new_files.insert(uri_str.clone());
-            self.failures.entry(uri_str).or_default().push(failure);
-        }
-
-        // Find files that had diagnostics before but don't now
-        let stale: Vec<Url> = self
-            .files_with_diagnostics
-            .difference(&new_files)
-            .filter_map(|s| Url::parse(s).ok())
-            .collect();
-
-        // Update tracking
-        self.files_with_diagnostics = new_files;
-
-        stale
-    }
-
-    /// Find a failure at the given position for hover.
-    pub fn find_failure_at(&self, uri: &Url, position: Position) -> Option<&StoredFailure> {
-        let failures = self.failures.get(&uri.to_string())?;
-        failures
-            .iter()
-            .find(|f| contains_position(&f.range, position))
-    }
-}
-
-/// Check if a range contains a position.
-fn contains_position(range: &Range, pos: Position) -> bool {
-    if pos.line < range.start.line || pos.line > range.end.line {
-        return false;
-    }
-    if pos.line == range.start.line && pos.character < range.start.character {
-        return false;
-    }
-    if pos.line == range.end.line && pos.character > range.end.character {
-        return false;
-    }
-    true
+    /// Single source of truth for test results.
+    /// All LSP features (diagnostics, inlay hints, hover) derive from this.
+    pub test_store: Option<crate::store::TestResultStore>,
 }
 
 /// The squiggles LSP backend.
@@ -157,9 +51,7 @@ impl Backend {
                 config,
                 workspace_root: None,
                 workspace_metadata: None,
-                failures: HashMap::new(),
-                files_with_diagnostics: HashSet::new(),
-                test_results: HashMap::new(),
+                test_store: None,
             })),
             test_trigger,
         }
@@ -657,14 +549,14 @@ impl LanguageServer for Backend {
 
         // Re-publish diagnostics for this file if we have any
         let state = self.state.read().await;
-        if let Some(failures) = state.failures.get(&uri.to_string()) {
-            let diagnostics: Vec<Diagnostic> =
-                failures.iter().map(StoredFailure::to_diagnostic).collect();
-
-            drop(state); // Release lock before async call
-            self.client
-                .publish_diagnostics(uri, diagnostics, None)
-                .await;
+        if let Some(ref store) = state.test_store {
+            let diagnostics = store.diagnostics_for_file(&uri);
+            if !diagnostics.is_empty() {
+                drop(state); // Release lock before async call
+                self.client
+                    .publish_diagnostics(uri, diagnostics, None)
+                    .await;
+            }
         }
     }
 
@@ -677,18 +569,20 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         let state = self.state.read().await;
-        if let Some(stored) = state.find_failure_at(&uri, position) {
-            let workspace_root = state.workspace_root.as_deref();
-            let workspace_metadata = state.workspace_metadata.as_ref();
-            let content = format_failure_hover(&stored.failure, workspace_root, workspace_metadata);
+        if let Some(ref store) = state.test_store {
+            if let Some(failure) = store.failure_at_position(&uri, position) {
+                let workspace_root = state.workspace_root.as_deref();
+                let workspace_metadata = state.workspace_metadata.as_ref();
+                let content = format_failure_hover(failure, workspace_root, workspace_metadata);
 
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: content,
-                }),
-                range: Some(stored.range),
-            }));
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: content,
+                    }),
+                    range: None,
+                }));
+            }
         }
 
         Ok(None)
@@ -700,15 +594,13 @@ impl LanguageServer for Backend {
     ) -> Result<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri;
 
-        // Get diagnostics we've already computed for this file
+        // Get diagnostics from the store
         let state = self.state.read().await;
-        let items: Vec<Diagnostic> = state
-            .failures
-            .get(&uri.to_string())
-            .into_iter()
-            .flatten()
-            .map(StoredFailure::to_diagnostic)
-            .collect();
+        let items = if let Some(ref store) = state.test_store {
+            store.diagnostics_for_file(&uri)
+        } else {
+            vec![]
+        };
 
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
@@ -722,6 +614,8 @@ impl LanguageServer for Backend {
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        use crate::store::TestOutcome;
+
         let uri = &params.text_document.uri;
 
         // Read the file to find #[test] functions
@@ -738,9 +632,9 @@ impl LanguageServer for Backend {
         let state = self.state.read().await;
 
         // If no test results yet, return empty
-        if state.test_results.is_empty() {
+        let Some(ref store) = state.test_store else {
             return Ok(None);
-        }
+        };
 
         // Find all #[test] functions with detailed span info
         let test_functions = find_test_functions_detailed(&content);
@@ -754,19 +648,10 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            // Try to find matching test result
-            // Test names in nextest are: `{crate}::{binary}${module}::{fn_name}`
-            // We match by suffix since we only have the function name
-            let result = state.test_results.iter().find(|(name, _)| {
-                // Match the function name at the end after ::
-                name.ends_with(&format!("::{}", info.name))
-                    || name.ends_with(&format!("${}", info.name))
-                    || **name == info.name
-            });
-
-            if let Some((_, test_result)) = result {
-                match test_result {
-                    TestResult::Passed => {
+            // Look up result by short name
+            if let Some(entry) = store.result_for_test_name(&info.name) {
+                match &entry.outcome {
+                    TestOutcome::Passed => {
                         // Simple pass hint after the #[test] attribute
                         hints.push(InlayHint {
                             position: Position {
@@ -782,7 +667,7 @@ impl LanguageServer for Backend {
                             data: None,
                         });
                     }
-                    TestResult::Failed(stored) => {
+                    TestOutcome::Failed { failure } => {
                         // Fail hint after the #[test] attribute
                         hints.push(InlayHint {
                             position: Position {
@@ -794,7 +679,7 @@ impl LanguageServer for Backend {
                             text_edits: None,
                             tooltip: Some(InlayHintTooltip::String(format!(
                                 "Test failed: {}",
-                                stored.failure.message
+                                failure.message
                             ))),
                             padding_left: Some(false),
                             padding_right: Some(true),
@@ -803,7 +688,7 @@ impl LanguageServer for Backend {
 
                         // Full error message above the #[test] attribute
                         // (without backtrace, just the message)
-                        if !stored.failure.message.is_empty() {
+                        if !failure.message.is_empty() {
                             // Match the indentation of the #[test] attribute
                             let indent = " ".repeat(info.attr_span.col as usize);
                             // Wavy vertical border characters
@@ -814,8 +699,7 @@ impl LanguageServer for Backend {
                             let content_width = MAX_WIDTH.saturating_sub(indent.len() + 3); // 3 for "│  "
 
                             // Format the message with proper indentation, wrapping, and wavy left border
-                            let formatted_lines: Vec<String> = stored
-                                .failure
+                            let formatted_lines: Vec<String> = failure
                                 .message
                                 .lines()
                                 .flat_map(|line| wrap_line(line, content_width))
@@ -1105,12 +989,15 @@ async fn test_runner_loop(
     state: Arc<RwLock<ServerState>>,
     client: Client,
 ) {
-    use crate::diagnostics::{TestFunctionIndex, extract_test_name, failures_to_diagnostics};
     use crate::runner::{RunLogEvent, RunOutcome, run_package_tests, run_tests_verbose};
+    use crate::store::{LspPublisher, TestResultStore};
     use tokio_util::sync::CancellationToken;
 
     // Token to cancel the current test run
     let mut current_cancel: Option<CancellationToken> = None;
+
+    // Publisher persists across runs to track which files have diagnostics
+    let mut publisher = LspPublisher::new(client.clone());
 
     while let Some(saved_file) = rx.recv().await {
         // Cancel any running test
@@ -1202,16 +1089,22 @@ async fn test_runner_loop(
         let (log_tx, mut log_rx) = mpsc::channel::<RunLogEvent>(4096);
         let log_client = client.clone();
         let log_progress = Arc::clone(&progress);
-        let log_state = Arc::clone(&state);
-        let log_workspace_root = workspace_root.clone();
         let scan_exclude: Vec<String> = config.scan_exclude.clone().unwrap_or_default();
+
+        // Create the test result store for this run
+        let store = Arc::new(RwLock::new(TestResultStore::new(
+            workspace_root.clone(),
+            workspace_metadata.clone(),
+            &scan_exclude,
+        )));
+        let log_store = Arc::clone(&store);
+
+        // Create a publisher for incremental updates during the run
+        let mut log_publisher = LspPublisher::new(log_client.clone());
 
         // Track test progress
         let mut tests_completed = 0u32;
         let mut tests_total = 0u32;
-
-        // Build test function index once at the start for incremental updates
-        let test_index = TestFunctionIndex::build_with_excludes(&log_workspace_root, &scan_exclude);
 
         // Spawn a task to forward log events to the LSP client and update progress
         let log_task = tokio::spawn(async move {
@@ -1292,57 +1185,26 @@ async fn test_runner_loop(
                         }
                     }
                     RunLogEvent::TestPassed { name } => {
-                        // Check if this test previously failed - if so, clear its diagnostic
-                        let short_name = extract_test_name(&name);
-                        if let Some(test_loc) = test_index.get(&short_name) {
-                            let uri = Some(test_loc.uri.clone());
-
-                            let mut state_guard = log_state.write().await;
-                            // Check if it was previously failed
-                            if let Some(TestResult::Failed(_)) = state_guard.test_results.get(&name)
-                            {
-                                // Update to passed
-                                state_guard
-                                    .test_results
-                                    .insert(name.clone(), TestResult::Passed);
-
-                                // Rebuild diagnostics for this file
-                                if let Some(uri) = uri {
-                                    let diagnostics =
-                                        rebuild_diagnostics_for_file(&state_guard, &uri);
-                                    drop(state_guard);
-                                    log_client.publish_diagnostics(uri, diagnostics, None).await;
-                                }
-                            } else {
-                                // Just mark as passed
-                                state_guard
-                                    .test_results
-                                    .insert(name.clone(), TestResult::Passed);
-                            }
-                        }
+                        // Record the pass in the store
+                        let mut store_guard = log_store.write().await;
+                        store_guard.record_pass(name);
+                        // Note: We could publish incremental updates here, but for passes
+                        // it's usually not necessary since the UI already shows no error.
+                        // The final publish_all will handle clearing any stale diagnostics.
                     }
                     RunLogEvent::TestFailed { failure } => {
-                        // Immediately publish diagnostic for this failure
-                        let short_name = extract_test_name(&failure.name);
-                        if let Some(test_loc) = test_index.get(&short_name) {
-                            let uri = Some(test_loc.uri.clone());
+                        // Record the failure and publish incremental update
+                        let mut store_guard = log_store.write().await;
+                        store_guard.record_failure(failure);
 
-                            let mut state_guard = log_state.write().await;
-                            // Store the failure
-                            state_guard.test_results.insert(
-                                failure.name.clone(),
-                                TestResult::Failed(StoredFailure {
-                                    failure: failure.clone(),
-                                    range: test_loc.name_span.to_range(),
-                                }),
-                            );
+                        // Get the affected files and publish immediately
+                        let files = store_guard.files_with_failures();
+                        drop(store_guard);
 
-                            // Rebuild diagnostics for this file
-                            if let Some(uri) = uri {
-                                let diagnostics = rebuild_diagnostics_for_file(&state_guard, &uri);
-                                drop(state_guard);
-                                log_client.publish_diagnostics(uri, diagnostics, None).await;
-                            }
+                        // Publish diagnostics for affected files
+                        let store_guard = log_store.read().await;
+                        for uri in files {
+                            log_publisher.publish_file(&store_guard, &uri).await;
                         }
                     }
                     RunLogEvent::Completed { stats } => {
@@ -1401,97 +1263,18 @@ async fn test_runner_loop(
 
                 client.log_message(MessageType::INFO, &summary).await;
 
-                // Build test function index and convert failures to diagnostics
-                let scan_exclude = config.scan_exclude.as_deref().unwrap_or(&[]);
-                let test_index =
-                    TestFunctionIndex::build_with_excludes(&workspace_root, scan_exclude);
-                let diagnostics_by_file =
-                    failures_to_diagnostics(&result.failures, &workspace_root, &test_index);
+                // The store was populated by incremental updates during the run.
+                // Now do a final atomic publish to ensure consistency.
+                let store_guard = store.read().await;
+                publisher.publish_all(&store_guard).await;
+                drop(store_guard);
 
-                // Store failures for hover lookup and get stale files
-                // We store at BOTH the function name location AND the panic location
-                // so hover works on either.
-                let stale_uris = {
-                    let mut state_guard = state.write().await;
-                    let mut stored: Vec<(Url, StoredFailure)> = Vec::new();
-
-                    for f in &result.failures {
-                        let short_name = extract_test_name(&f.name);
-
-                        // Store at the test function location (for hovering on fn name)
-                        if let Some(loc) = test_index.get(&short_name) {
-                            stored.push((
-                                loc.uri.clone(),
-                                StoredFailure {
-                                    failure: f.clone(),
-                                    range: loc.name_span.to_range(),
-                                },
-                            ));
-                        }
-
-                        // Also store at the panic location (for hovering on panic site)
-                        if let Some(panic_loc) = f.panic_location.as_ref() {
-                            let file_path = resolve_path(&panic_loc.file, &workspace_root);
-                            if let Ok(uri) = Url::from_file_path(&file_path) {
-                                stored.push((
-                                    uri,
-                                    StoredFailure {
-                                        failure: f.clone(),
-                                        range: location_to_range(panic_loc),
-                                    },
-                                ));
-                            }
-                        }
-                    }
-
-                    // Build new test results map first, then swap atomically
-                    // (avoids clearing results while inlay hints might be requested)
-                    let mut new_test_results = HashMap::new();
-                    for name in &result.passed_tests {
-                        new_test_results.insert(name.clone(), TestResult::Passed);
-                    }
-                    for failure in &result.failures {
-                        let short_name = extract_test_name(&failure.name);
-                        if let Some(test_loc) = test_index.get(&short_name) {
-                            new_test_results.insert(
-                                failure.name.clone(),
-                                TestResult::Failed(StoredFailure {
-                                    failure: failure.clone(),
-                                    range: test_loc.name_span.to_range(),
-                                }),
-                            );
-                        } else if let Some(loc) = &failure.panic_location {
-                            let file_path = resolve_path(&loc.file, &workspace_root);
-                            if let Ok(_uri) = Url::from_file_path(&file_path) {
-                                new_test_results.insert(
-                                    failure.name.clone(),
-                                    TestResult::Failed(StoredFailure {
-                                        failure: failure.clone(),
-                                        range: location_to_range(loc),
-                                    }),
-                                );
-                            }
-                        }
-                    }
-                    // Atomic swap
-                    state_guard.test_results = new_test_results;
-
-                    state_guard.store_failures(stored)
-                };
-
-                // Clear diagnostics from files that no longer have failures
-                for uri in stale_uris {
-                    client.publish_diagnostics(uri, vec![], None).await;
-                }
-
-                // Publish diagnostics for each file with failures
-                // Also track these URIs so we can clear them later
+                // Update ServerState with the final store
                 {
                     let mut state_guard = state.write().await;
-                    for (uri, diags) in diagnostics_by_file {
-                        state_guard.files_with_diagnostics.insert(uri.to_string());
-                        client.publish_diagnostics(uri, diags, None).await;
-                    }
+                    // Clone the store (it's relatively small)
+                    let final_store = store.read().await.clone();
+                    state_guard.test_store = Some(final_store);
                 }
 
                 // End progress with summary
@@ -1506,18 +1289,11 @@ async fn test_runner_loop(
                     .log_message(MessageType::ERROR, format!("Build failed:\n{stderr}"))
                     .await;
 
-                // Clear all test results since we couldn't run tests
+                // Clear all diagnostics and test results
+                publisher.clear_all().await;
                 {
                     let mut state_guard = state.write().await;
-                    state_guard.test_results.clear();
-                    // Clear stored failures too
-                    let stale_uris = state_guard.store_failures(vec![]);
-                    drop(state_guard);
-
-                    // Clear diagnostics from all files that had them
-                    for uri in stale_uris {
-                        client.publish_diagnostics(uri, vec![], None).await;
-                    }
+                    state_guard.test_store = None;
                 }
 
                 progress.end(Some(summary)).await;
@@ -1530,16 +1306,11 @@ async fn test_runner_loop(
                     .log_message(MessageType::ERROR, format!("Process failed: {msg}"))
                     .await;
 
-                // Clear all test results
+                // Clear all diagnostics and test results
+                publisher.clear_all().await;
                 {
                     let mut state_guard = state.write().await;
-                    state_guard.test_results.clear();
-                    let stale_uris = state_guard.store_failures(vec![]);
-                    drop(state_guard);
-
-                    for uri in stale_uris {
-                        client.publish_diagnostics(uri, vec![], None).await;
-                    }
+                    state_guard.test_store = None;
                 }
 
                 progress.end(Some(summary)).await;
@@ -1551,31 +1322,6 @@ async fn test_runner_loop(
             }
         }
     }
-}
-
-/// Rebuild all diagnostics for a single file based on current state.
-///
-/// This is used for incremental updates when test results stream in.
-fn rebuild_diagnostics_for_file(state: &ServerState, uri: &Url) -> Vec<Diagnostic> {
-    use crate::diagnostics::extract_failure_summary;
-
-    let mut diagnostics = Vec::new();
-
-    // Check the failures map which is keyed by URI string
-    if let Some(failures) = state.failures.get(&uri.to_string()) {
-        for stored in failures {
-            let message = extract_failure_summary(&stored.failure.full_output);
-            diagnostics.push(Diagnostic {
-                range: stored.range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                source: Some("squiggles".to_string()),
-                message,
-                ..Default::default()
-            });
-        }
-    }
-
-    diagnostics
 }
 
 /// Format a test failure for hover display.
@@ -1896,33 +1642,6 @@ fn wrap_line(line: &str, max_width: usize) -> Vec<String> {
     }
 
     result
-}
-
-/// Resolve a file path relative to the workspace root.
-fn resolve_path(file: &str, workspace_root: &std::path::Path) -> std::path::PathBuf {
-    let file_path = std::path::Path::new(file);
-    if file_path.is_absolute() {
-        file_path.to_path_buf()
-    } else {
-        let clean = file.strip_prefix("./").unwrap_or(file);
-        workspace_root.join(clean)
-    }
-}
-
-/// Convert a SourceLocation to an LSP Range.
-fn location_to_range(loc: &crate::nextest::SourceLocation) -> Range {
-    let line = loc.line.saturating_sub(1);
-    let col = loc.column.saturating_sub(1);
-    Range {
-        start: Position {
-            line,
-            character: col,
-        },
-        end: Position {
-            line,
-            character: col,
-        },
-    }
 }
 
 #[cfg(test)]

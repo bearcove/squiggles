@@ -10,4 +10,5 @@ pub mod metadata;
 pub mod nextest;
 pub mod progress;
 pub mod runner;
+pub mod store;
 pub mod watcher;
