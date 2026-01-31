@@ -152,20 +152,18 @@ fn parse_build_progress(line: &str) -> Option<BuildProgress> {
 /// This function reads both stdout and stderr concurrently, so it won't hang
 /// even if the build fails and produces no JSON output.
 pub async fn run_tests(workspace_root: &Path, config: &Config) -> RunOutcome {
-    run_tests_verbose(workspace_root, config, None, CancellationToken::new(), None).await
+    run_tests_verbose(workspace_root, config, None, CancellationToken::new()).await
 }
 
-/// Run tests with verbose logging via a channel.
+/// Run tests with verbose logging via a channel (workspace mode).
 ///
 /// If `log_tx` is provided, log events will be sent as they happen.
 /// If `cancel` is triggered, the test process will be killed.
-/// If `package_filter` is provided, only run tests for that package and its rdeps.
 pub async fn run_tests_verbose(
     workspace_root: &Path,
     config: &Config,
     log_tx: Option<mpsc::Sender<RunLogEvent>>,
     cancel: CancellationToken,
-    package_filter: Option<&str>,
 ) -> RunOutcome {
     // Get the effective test config (workspace or legacy filter)
     let test_config = config.effective_workspace_config();
@@ -176,7 +174,7 @@ pub async fn run_tests_verbose(
         test_config.as_ref(),
         log_tx,
         cancel,
-        package_filter,
+        None, // No package filter in workspace mode
     )
     .await
 }
@@ -238,30 +236,18 @@ async fn run_tests_with_config(
         }
     }
 
-    // Build the filter expression
-    let mut filter_parts = Vec::new();
-
-    // Add package filter (rdeps) if specified
+    // Add package filter if specified (package mode)
     if let Some(package) = package_filter {
-        filter_parts.push(format!("rdeps({package})"));
+        args.push("-p".to_string());
+        args.push(package.to_string());
     }
 
     // Add user's filter expression from test config
     if let Some(ref tc) = test_config {
         if let Some(ref filter) = tc.filter {
-            filter_parts.push(filter.clone());
+            args.push("-E".to_string());
+            args.push(filter.clone());
         }
-    }
-
-    // Combine filters with AND if both are present
-    if !filter_parts.is_empty() {
-        let combined = if filter_parts.len() == 1 {
-            filter_parts.pop().unwrap()
-        } else {
-            format!("({}) & ({})", filter_parts[0], filter_parts[1])
-        };
-        args.push("-E".to_string());
-        args.push(combined);
     }
 
     let command_str = format!("cargo {}", args.join(" "));

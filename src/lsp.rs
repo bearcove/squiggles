@@ -1190,14 +1190,8 @@ async fn test_runner_loop(
                     .await;
             }
             continue;
-        } else if let Some(ref pkg) = detected_package {
-            client
-                .log_message(
-                    MessageType::INFO,
-                    format!("Running tests for package: {pkg} (and rdeps)"),
-                )
-                .await;
         }
+        // else: workspace mode - run all tests
 
         // Start progress indicator
         let progress =
@@ -1387,15 +1381,8 @@ async fn test_runner_loop(
             )
             .await
         } else {
-            // Workspace mode: run tests with optional package filter for rdeps
-            run_tests_verbose(
-                &workspace_root,
-                &config,
-                Some(log_tx),
-                cancel,
-                detected_package.as_deref(),
-            )
-            .await
+            // Workspace mode: run all tests
+            run_tests_verbose(&workspace_root, &config, Some(log_tx), cancel).await
         };
 
         // Wait for log task to finish
