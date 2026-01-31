@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::nextest::{self, NextestMessage, TestFailure};
+use squiggles_config::TestConfig;
 
 /// Result of a test run.
 #[derive(Debug)]
@@ -166,6 +167,49 @@ pub async fn run_tests_verbose(
     cancel: CancellationToken,
     package_filter: Option<&str>,
 ) -> RunOutcome {
+    // Get the effective test config (workspace or legacy filter)
+    let test_config = config.effective_workspace_config();
+
+    run_tests_with_config(
+        workspace_root,
+        config,
+        test_config.as_ref(),
+        log_tx,
+        cancel,
+        package_filter,
+    )
+    .await
+}
+
+/// Run tests for a specific package with its own configuration.
+pub async fn run_package_tests(
+    workspace_root: &Path,
+    config: &Config,
+    package: &str,
+    test_config: &TestConfig,
+    log_tx: Option<mpsc::Sender<RunLogEvent>>,
+    cancel: CancellationToken,
+) -> RunOutcome {
+    run_tests_with_config(
+        workspace_root,
+        config,
+        Some(test_config),
+        log_tx,
+        cancel,
+        Some(package),
+    )
+    .await
+}
+
+/// Internal function that runs tests with a specific TestConfig.
+async fn run_tests_with_config(
+    workspace_root: &Path,
+    config: &Config,
+    test_config: Option<&TestConfig>,
+    log_tx: Option<mpsc::Sender<RunLogEvent>>,
+    cancel: CancellationToken,
+    package_filter: Option<&str>,
+) -> RunOutcome {
     let start_time = Instant::now();
 
     let mut args = vec![
@@ -182,6 +226,18 @@ pub async fn run_tests_verbose(
         args.push(target_dir.display().to_string());
     }
 
+    // Add features from test config
+    if let Some(ref tc) = test_config {
+        if tc.all_features {
+            args.push("--all-features".to_string());
+        } else if let Some(ref features) = tc.features {
+            if !features.is_empty() {
+                args.push("--features".to_string());
+                args.push(features.join(","));
+            }
+        }
+    }
+
     // Build the filter expression
     let mut filter_parts = Vec::new();
 
@@ -190,9 +246,11 @@ pub async fn run_tests_verbose(
         filter_parts.push(format!("rdeps({package})"));
     }
 
-    // Add user's filter expression if configured
-    if let Some(ref filter) = config.filter {
-        filter_parts.push(filter.clone());
+    // Add user's filter expression from test config
+    if let Some(ref tc) = test_config {
+        if let Some(ref filter) = tc.filter {
+            filter_parts.push(filter.clone());
+        }
     }
 
     // Combine filters with AND if both are present
@@ -232,6 +290,15 @@ pub async fn run_tests_verbose(
         .env("RUST_BACKTRACE", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // Add environment variables from test config
+    if let Some(ref tc) = test_config {
+        if let Some(ref env) = tc.env {
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+        }
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

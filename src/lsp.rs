@@ -314,12 +314,20 @@ impl Backend {
             state.config = config.clone();
         }
 
+        let mode = if config.is_package_mode() {
+            "package"
+        } else if config.workspace.is_some() {
+            "workspace"
+        } else {
+            "default"
+        };
+
         client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "squiggles: config reloaded (enabled: {} -> {}, filter: {:?})",
-                    was_enabled, config.enabled, config.filter
+                    "squiggles: config reloaded (enabled: {} -> {}, mode: {})",
+                    was_enabled, config.enabled, mode
                 ),
             )
             .await;

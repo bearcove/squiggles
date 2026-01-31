@@ -43,7 +43,8 @@ edition = "2021"
 
     let config = Config {
         enabled: true,
-        filter: None,
+        workspace: None,
+        packages: None,
         debounce_ms: 0,
         max_diagnostics: 50,
         captain: false,
@@ -102,7 +103,8 @@ fn test_math() {
 
     let config = Config {
         enabled: true,
-        filter: None,
+        workspace: None,
+        packages: None,
         debounce_ms: 0,
         max_diagnostics: 50,
         captain: false,
@@ -140,7 +142,8 @@ async fn test_runner_with_failures() {
 
     let config = Config {
         enabled: true,
-        filter: None,
+        workspace: None,
+        packages: None,
         debounce_ms: 0,
         max_diagnostics: 50,
         captain: false,
@@ -283,7 +286,8 @@ edition = "2021"
 
     let config = Config {
         enabled: true,
-        filter: None,
+        workspace: None,
+        packages: None,
         debounce_ms: 0,
         max_diagnostics: 50,
         captain: false,
