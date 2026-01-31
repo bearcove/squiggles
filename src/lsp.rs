@@ -1555,6 +1555,9 @@ fn format_failure_hover(
         "Test failed".to_string()
     };
 
+    // Extract pre-panic output (everything before the panic/crash line)
+    let pre_panic_output = extract_pre_panic_output(output);
+
     result.push_str("```\n");
     result.push_str(&message);
     result.push_str("\n```\n\n");
@@ -1730,7 +1733,47 @@ fn format_failure_hover(
         }
     }
 
+    // Add pre-panic output at the bottom if present
+    if !pre_panic_output.is_empty() {
+        result.push_str("\n---\n\n");
+        result.push_str("*Keep scrolling for full test output*\n\n");
+        result.push_str("```\n");
+        result.push_str(&pre_panic_output);
+        result.push_str("\n```\n");
+    }
+
     result
+}
+
+/// Extract output that appeared before the panic.
+///
+/// This captures any println!, logging, or other output the test produced
+/// before it crashed, which can be useful debugging context.
+fn extract_pre_panic_output(output: &str) -> String {
+    // Find where the panic starts
+    // Standard format: "thread '...' panicked at"
+    // Color-backtrace format: "The application panicked (crashed)."
+    let panic_start = output
+        .find("panicked at ")
+        .or_else(|| output.find("The application panicked"))
+        .unwrap_or(output.len());
+
+    // Also check for "thread '" which precedes the panic message
+    let thread_start = output.find("thread '").unwrap_or(panic_start);
+    let start = thread_start.min(panic_start);
+
+    if start == 0 {
+        return String::new();
+    }
+
+    // Get everything before the panic, trimmed
+    let pre_panic = output[..start].trim();
+
+    if pre_panic.is_empty() {
+        return String::new();
+    }
+
+    pre_panic.to_string()
 }
 
 /// Extract the message from color-backtrace format output.
@@ -2156,7 +2199,9 @@ fn test_with_parens() {}
     }
 
     mod hover_format {
-        use super::super::{extract_color_backtrace_message, format_failure_hover};
+        use super::super::{
+            extract_color_backtrace_message, extract_pre_panic_output, format_failure_hover,
+        };
         use crate::nextest::{BacktraceFrame, SourceLocation, TestFailure};
 
         #[test]
@@ -2250,6 +2295,44 @@ fn test_with_parens() {}
 
             let hover = format_failure_hover(&failure, None, None);
             assert!(hover.contains("custom error from color-backtrace"));
+        }
+
+        #[test]
+        fn extract_pre_panic_output_with_println() {
+            let output = "some debug output\nmore logging here\nthread 'test::my_test' panicked at src/lib.rs:10:5:\nassertion failed";
+            let pre = extract_pre_panic_output(output);
+            assert_eq!(pre, "some debug output\nmore logging here");
+        }
+
+        #[test]
+        fn extract_pre_panic_output_color_backtrace() {
+            let output =
+                "debug line 1\ndebug line 2\nThe application panicked (crashed).\nMessage:  oops";
+            let pre = extract_pre_panic_output(output);
+            assert_eq!(pre, "debug line 1\ndebug line 2");
+        }
+
+        #[test]
+        fn extract_pre_panic_output_empty_when_panic_at_start() {
+            let output = "thread 'test' panicked at src/lib.rs:1:1:\nboom";
+            let pre = extract_pre_panic_output(output);
+            assert!(pre.is_empty());
+        }
+
+        #[test]
+        fn format_failure_includes_pre_panic_output() {
+            let failure = TestFailure {
+                name: "test::my_test".to_string(),
+                message: "assertion failed".to_string(),
+                panic_location: None,
+                user_frames: vec![],
+                full_output: "setup complete\nrunning step 1\nthread 'test::my_test' panicked at src/lib.rs:10:5:\nassertion failed".to_string(),
+            };
+
+            let hover = format_failure_hover(&failure, None, None);
+            assert!(hover.contains("Keep scrolling for full test output"));
+            assert!(hover.contains("setup complete"));
+            assert!(hover.contains("running step 1"));
         }
     }
 
