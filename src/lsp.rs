@@ -617,27 +617,39 @@ impl LanguageServer for Backend {
         use crate::store::TestOutcome;
 
         let uri = &params.text_document.uri;
+        tracing::debug!(%uri, range = ?params.range, "inlay_hint: request received");
 
         // Read the file to find #[test] functions
         let file_path = match uri.to_file_path() {
             Ok(p) => p,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                tracing::debug!(%uri, "inlay_hint: could not convert URI to file path, returning null");
+                return Ok(None);
+            }
         };
 
         let content = match tokio::fs::read_to_string(&file_path).await {
             Ok(c) => c,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                tracing::debug!(path = %file_path.display(), error = %e, "inlay_hint: could not read file, returning null");
+                return Ok(None);
+            }
         };
 
         let state = self.state.read().await;
 
         // If no test results yet, return empty
         let Some(ref store) = state.test_store else {
+            tracing::debug!("inlay_hint: no test_store in state yet, returning null");
             return Ok(None);
         };
 
+        tracing::debug!(entry_count = store.len(), test_names = ?store.test_names().collect::<Vec<_>>(), "inlay_hint: store contents");
+
         // Find all #[test] functions with detailed span info
         let test_functions = find_test_functions_detailed(&content);
+        tracing::debug!(count = test_functions.len(), range = ?params.range, "inlay_hint: found #[test] functions in file");
+
         let mut hints = Vec::new();
 
         for info in test_functions {
@@ -645,11 +657,14 @@ impl LanguageServer for Backend {
             if info.name_span.line < params.range.start.line
                 || info.name_span.line > params.range.end.line
             {
+                tracing::debug!(name = %info.name, line = info.name_span.line, range_start = params.range.start.line, range_end = params.range.end.line, "inlay_hint: skipping test outside requested range");
                 continue;
             }
 
             // Look up result by short name
-            if let Some(entry) = store.result_for_test_name(&info.name) {
+            let entry = store.result_for_test_name(&info.name);
+            tracing::debug!(name = %info.name, line = info.name_span.line, found = entry.is_some(), "inlay_hint: store lookup");
+            if let Some(entry) = entry {
                 match &entry.outcome {
                     TestOutcome::Passed => {
                         // Simple pass hint after the #[test] attribute
@@ -694,8 +709,8 @@ impl LanguageServer for Backend {
                             // Wavy vertical border characters
                             let wavy = ["│", "╎", "┊", "╏", "┆"];
 
-                            // Wrap lines at 80 characters (accounting for indent + border + spacing)
-                            const MAX_WIDTH: usize = 80;
+                            // Wrap lines at 75 characters (accounting for indent + border + spacing)
+                            const MAX_WIDTH: usize = 75;
                             let content_width = MAX_WIDTH.saturating_sub(indent.len() + 3); // 3 for "│  "
 
                             // Format the message with proper indentation, wrapping, and wavy left border
@@ -743,6 +758,7 @@ impl LanguageServer for Backend {
             }
         }
 
+        tracing::debug!(hint_count = hints.len(), "inlay_hint: returning hints");
         if hints.is_empty() {
             Ok(None)
         } else {

@@ -42,6 +42,7 @@ strip-ansi-escapes = "0.2"
 styx-embed = { git = "https://github.com/bearcove/styx", branch = "main" }
 cargo_metadata = "0.23.1"
 file-rotate = "0.8.0"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [build-dependencies]
 squiggles-config = { path = "crates/squiggles-config" }

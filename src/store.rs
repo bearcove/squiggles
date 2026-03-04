@@ -238,6 +238,21 @@ impl TestResultStore {
             .find(|entry| entry.short_name == short_name)
     }
 
+    /// Number of test results in the store.
+    pub fn len(&self) -> usize {
+        self.results.len()
+    }
+
+    /// Whether the store has no test results.
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
+    }
+
+    /// All full test names currently in the store (for debugging).
+    pub fn test_names(&self) -> impl Iterator<Item = &str> {
+        self.results.keys().map(|s| s.as_str())
+    }
+
     // === HOVER ===
 
     /// Find a failure at the given position for hover.

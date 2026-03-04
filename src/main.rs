@@ -1,6 +1,7 @@
 use facet::Facet;
 use facet_styx::StyxFormat;
 use figue as args;
+use tracing_subscriber::EnvFilter;
 
 use squiggles::config::Config;
 use squiggles::lsp;
@@ -52,6 +53,12 @@ fn main() {
 }
 
 fn run_lsp(config: Config) {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(EnvFilter::new("debug"))
+        .with_ansi(false)
+        .init();
+
     // Start the LSP server (it handles enabled/disabled state internally)
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

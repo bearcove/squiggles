@@ -365,10 +365,12 @@ fn resolve_path(file: &str, workspace_root: &Path) -> std::path::PathBuf {
 /// Full name: `sample-crate::sample_crate$tests::test_panic`
 /// Short name: `test_panic`
 pub fn extract_test_name(full_name: &str) -> String {
-    full_name
-        .rsplit("::")
+    let after_colons = full_name.rsplit("::").next().unwrap_or(full_name);
+    // Nextest full names look like "crate::binary$module::test_name" — strip the "binary$" prefix
+    after_colons
+        .rsplit('$')
         .next()
-        .unwrap_or(full_name)
+        .unwrap_or(after_colons)
         .to_string()
 }
 
